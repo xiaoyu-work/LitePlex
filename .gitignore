@@ -1,0 +1,41 @@
+# Model files
+Jan-v1-4B/
+*.pth
+*.bin
+*.safetensors
+*.gguf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Environment variables (IMPORTANT: contains API keys)
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+.next/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+backend.log
+
+# Misc
+*.bak
+*.tmp

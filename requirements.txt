@@ -1,0 +1,39 @@
+# API and server dependencies
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+httpx>=0.25.0
+
+# MCP integration
+fastmcp>=0.1.0
+
+# Tool parsing
+outlines>=0.0.34
+
+# Additional utilities
+requests>=2.31.0
+python-multipart>=0.0.9
+typing-extensions>=4.9.0
+
+# For async operations
+aiohttp>=3.9.0
+
+# For interactive chat client
+rich>=13.0.0
+
+# LangGraph dependencies
+langgraph>=0.0.20
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-core>=0.1.0
+
+# Web interface dependencies
+Flask>=2.3.0
+flask-cors>=4.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# LLM providers support
+langchain-anthropic>=0.1.0
+langchain-google-genai>=0.0.5

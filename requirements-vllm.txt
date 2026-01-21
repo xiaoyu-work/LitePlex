@@ -1,0 +1,8 @@
+# vLLM and dependencies (Linux/WSL only)
+# Install with: pip install -r requirements-vllm.txt
+vllm>=0.5.0
+torch>=2.0.0
+transformers>=4.40.0
+accelerate>=0.27.0
+sentencepiece
+protobuf
