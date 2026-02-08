@@ -103,7 +103,7 @@ def extract_domain(url: str) -> str:
     try:
         parsed = urlparse(url)
         return parsed.netloc.lower()
-    except:
+    except (ValueError, AttributeError):
         return url.lower()
 
 # Helper function to search single query
@@ -514,12 +514,12 @@ def summarize_node(state: AgentState) -> dict:
                     tool_result = data['text']
                     sources_data = data.get('sources', [])
                     break
-            except:
+            except (json.JSONDecodeError, ValueError, TypeError):
                 # Fallback to old format
                 if 'Search results for' in str(msg.content):
                     tool_result = msg.content
                     break
-    
+
     parse_time = time.time() - parse_start
     logger.info(f"⏱️  [SUMMARIZE PARSE] Message parsing took: {parse_time:.2f}s")
     
@@ -899,7 +899,7 @@ def stream_summarize(messages, user_question, stop_event=None):
                     tool_result = data['text']
                     sources_data = data.get('sources', [])
                     break
-            except:
+            except (json.JSONDecodeError, ValueError, TypeError):
                 if 'Search results for' in str(msg.content):
                     tool_result = msg.content
                     break

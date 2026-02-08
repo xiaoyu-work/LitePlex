@@ -28,7 +28,8 @@ export async function POST(req: NextRequest) {
     const textId = Math.random().toString(36).substring(7)
     
     // Call your Python backend
-    const response = await fetch('http://localhost:8088/api/chat', {
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8088'
+    const response = await fetch(`${backendUrl}/api/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

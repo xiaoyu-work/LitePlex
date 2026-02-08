@@ -136,6 +136,10 @@ MODEL_NAME=./Jan-v1-4B
 # Backend Server Configuration (optional)
 BACKEND_PORT=8088
 BACKEND_HOST=0.0.0.0
+
+# Frontend Backend URL (optional, for deployment)
+# Set this if the backend is not running on localhost:8088
+# NEXT_PUBLIC_BACKEND_URL=http://localhost:8088
 ```
 
 ## License

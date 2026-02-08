@@ -256,22 +256,32 @@ if __name__ == '__main__':
     BACKEND_HOST = os.getenv('BACKEND_HOST', '0.0.0.0')
     BACKEND_PORT = int(os.getenv('BACKEND_PORT', '8088'))
     
-    # Kill any existing process on the configured port
+    # Kill any existing process on the configured port (cross-platform)
     try:
-        # Find process using the port
-        result = subprocess.run(['lsof', f'-ti:{BACKEND_PORT}'], capture_output=True, text=True)
-        if result.stdout.strip():
-            pids = result.stdout.strip().split('\n')
-            for pid in pids:
-                try:
-                    subprocess.run(['kill', '-9', pid])
-                    print(f"✅ Killed existing process on port {BACKEND_PORT} (PID: {pid})")
-                except:
-                    pass
-            # Wait a moment for port to be released
-            time.sleep(1)
-    except Exception as e:
-        # lsof might not be available on all systems
+        if sys.platform == 'win32':
+            result = subprocess.run(
+                ['netstat', '-ano'], capture_output=True, text=True
+            )
+            for line in result.stdout.splitlines():
+                if f':{BACKEND_PORT}' in line and 'LISTENING' in line:
+                    pid = line.strip().split()[-1]
+                    try:
+                        subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True)
+                        print(f"Killed existing process on port {BACKEND_PORT} (PID: {pid})")
+                    except Exception:
+                        pass
+        else:
+            result = subprocess.run(['lsof', f'-ti:{BACKEND_PORT}'], capture_output=True, text=True)
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid in pids:
+                    try:
+                        subprocess.run(['kill', '-9', pid])
+                        print(f"Killed existing process on port {BACKEND_PORT} (PID: {pid})")
+                    except Exception:
+                        pass
+        time.sleep(1)
+    except Exception:
         pass
     
     print(f"""
