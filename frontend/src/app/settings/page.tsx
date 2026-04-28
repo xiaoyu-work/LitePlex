@@ -3,141 +3,64 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { ChevronLeft, Save, Info, Check } from 'lucide-react'
+import {
+  defaultSettings,
+  getActiveLLMConfig,
+  LLMProvider,
+  LLMSettings,
+  providerInfo,
+  sanitizeSettings
+} from '@/lib/llm-settings'
 
-type LLMProvider = 'vllm' | 'openai' | 'anthropic' | 'google' | 'deepseek' | 'qwen'
+function loadInitialSettings(): LLMSettings {
+  if (typeof window === 'undefined') {
+    return defaultSettings
+  }
 
-interface ProviderConfig {
-  apiKey?: string
-  modelName?: string
-  vllmUrl?: string
-}
-
-interface LLMSettings {
-  activeProvider: LLMProvider
-  providers: Record<LLMProvider, ProviderConfig>
-}
-
-const providerInfo = {
-  vllm: {
-    name: 'Local/vLLM Server',
-    description: 'Connect to a local or remote vLLM-compatible inference server (vLLM, Ollama, LM Studio, etc.)',
-    fields: ['vllmUrl', 'modelName'],
-    defaults: {
-      vllmUrl: 'http://localhost:1234/v1',
-      modelName: './Jan-v1-4B'
+  const savedSettings = localStorage.getItem('llmSettings')
+  if (savedSettings) {
+    try {
+      return sanitizeSettings(JSON.parse(savedSettings))
+    } catch (error) {
+      console.error('Failed to parse settings:', error)
+      return defaultSettings
     }
-  },
-  openai: {
-    name: 'OpenAI',
-    description: 'Use OpenAI GPT models',
-    fields: ['apiKey', 'modelName'],
-    defaults: {
-      modelName: 'gpt-4-turbo-preview'
-    },
-    placeholder: 'e.g., gpt-4-turbo-preview, gpt-4, gpt-3.5-turbo'
-  },
-  anthropic: {
-    name: 'Anthropic Claude',
-    description: 'Use Anthropic Claude models',
-    fields: ['apiKey', 'modelName'],
-    defaults: {
-      modelName: 'claude-3-opus-20240229'
-    },
-    placeholder: 'e.g., claude-3-opus-20240229, claude-3-sonnet-20240229'
-  },
-  google: {
-    name: 'Google Gemini',
-    description: 'Use Google Gemini models',
-    fields: ['apiKey', 'modelName'],
-    defaults: {
-      modelName: 'gemini-pro'
-    },
-    placeholder: 'e.g., gemini-pro, gemini-1.5-pro, gemini-pro-vision'
-  },
-  deepseek: {
-    name: 'DeepSeek',
-    description: 'Use DeepSeek models',
-    fields: ['apiKey', 'modelName'],
-    defaults: {
-      modelName: 'deepseek-chat'
-    },
-    placeholder: 'e.g., deepseek-chat, deepseek-coder'
-  },
-  qwen: {
-    name: 'Qwen (通义千问)',
-    description: 'Use Alibaba Qwen models',
-    fields: ['apiKey', 'modelName'],
-    defaults: {
-      modelName: 'qwen-turbo'
-    },
-    placeholder: 'e.g., qwen-turbo, qwen-plus, qwen-max'
   }
-}
 
-// Default settings structure
-const defaultSettings: LLMSettings = {
-  activeProvider: 'vllm',
-  providers: {
-    vllm: {
-      vllmUrl: 'http://localhost:1234/v1',
-      modelName: './Jan-v1-4B'
-    },
-    openai: { modelName: 'gpt-4-turbo-preview' },
-    anthropic: { modelName: 'claude-3-opus-20240229' },
-    google: { modelName: 'gemini-pro' },
-    deepseek: { modelName: 'deepseek-chat' },
-    qwen: { modelName: 'qwen-turbo' }
+  const legacyConfig = localStorage.getItem('llmConfig')
+  if (legacyConfig) {
+    try {
+      const parsed = JSON.parse(legacyConfig) as { provider?: LLMProvider; modelName?: string; vllmUrl?: string }
+      const provider = parsed.provider && parsed.provider in providerInfo ? parsed.provider : 'vllm'
+
+      return sanitizeSettings({
+        ...defaultSettings,
+        activeProvider: provider,
+        providers: {
+          ...defaultSettings.providers,
+          [provider]: parsed
+        }
+      })
+    } catch (error) {
+      console.error('Failed to parse legacy settings:', error)
+    }
   }
+
+  return defaultSettings
 }
 
 export default function SettingsPage() {
   const router = useRouter()
-  const [settings, setSettings] = useState<LLMSettings>(defaultSettings)
-  const [editingProvider, setEditingProvider] = useState<LLMProvider>('vllm')
+  const [initialSettings] = useState(loadInitialSettings)
+  const [settings, setSettings] = useState<LLMSettings>(initialSettings)
+  const [editingProvider, setEditingProvider] = useState<LLMProvider>(initialSettings.activeProvider)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
 
   useEffect(() => {
-    // Load saved settings from localStorage
-    const savedSettings = localStorage.getItem('llmSettings')
-    console.log('Loading saved settings:', savedSettings)
-    
-    if (savedSettings) {
-      try {
-        const parsed = JSON.parse(savedSettings)
-        console.log('Parsed settings:', parsed)
-        setSettings(parsed)
-        setEditingProvider(parsed.activeProvider || 'vllm')
-      } catch (e) {
-        console.error('Failed to parse settings:', e)
-        setSettings(defaultSettings)
-      }
-    } else {
-      // If no saved settings, check for legacy llmConfig
-      const legacyConfig = localStorage.getItem('llmConfig')
-      if (legacyConfig) {
-        const parsed = JSON.parse(legacyConfig)
-        const provider = parsed.provider || 'vllm'
-        // Migrate legacy config to new format
-        const newSettings = {
-          ...defaultSettings,
-          activeProvider: provider as LLMProvider,
-          providers: {
-            ...defaultSettings.providers,
-            [provider]: {
-              apiKey: parsed.apiKey,
-              modelName: parsed.modelName,
-              vllmUrl: parsed.vllmUrl
-            }
-          }
-        }
-        setSettings(newSettings)
-        setEditingProvider(provider as LLMProvider)
-      } else {
-        // No saved settings at all, use defaults are already set
-      }
-    }
-  }, [])
+    localStorage.setItem('llmSettings', JSON.stringify(settings))
+    localStorage.setItem('llmConfig', JSON.stringify(getActiveLLMConfig(settings)))
+  }, [settings])
 
   const handleProviderSelect = (provider: LLMProvider) => {
     setEditingProvider(provider)
@@ -153,15 +76,9 @@ export default function SettingsPage() {
     // Immediately save to localStorage when setting active
     localStorage.setItem('llmSettings', JSON.stringify(newSettings))
     
-    // Also update the active config for backward compatibility
-    const currentConfig = {
-      provider: provider,
-      ...newSettings.providers[provider]
-    }
-    localStorage.setItem('llmConfig', JSON.stringify(currentConfig))
+    localStorage.setItem('llmConfig', JSON.stringify(getActiveLLMConfig(newSettings)))
     
     setMessage(`${providerInfo[provider].name} set as active provider`)
-    console.log('Set active provider:', provider)
     setTimeout(() => setMessage(''), 2000)
   }
 
@@ -186,15 +103,8 @@ export default function SettingsPage() {
       // Save complete settings to localStorage
       localStorage.setItem('llmSettings', JSON.stringify(settings))
       
-      // Also save current active config for backward compatibility
-      const currentConfig = {
-        provider: settings.activeProvider,
-        ...settings.providers[settings.activeProvider]
-      }
+      const currentConfig = getActiveLLMConfig(settings)
       localStorage.setItem('llmConfig', JSON.stringify(currentConfig))
-      
-      console.log('Saved settings:', settings)
-      console.log('Active provider:', settings.activeProvider)
       
       // Try to send to backend
       try {
@@ -211,13 +121,12 @@ export default function SettingsPage() {
         } else {
           setMessage('Settings saved locally')
         }
-      } catch (backendError) {
-        console.log('Backend not available, settings saved locally')
+      } catch {
         setMessage('Settings saved locally')
       }
       
       setTimeout(() => setMessage(''), 3000)
-    } catch (error) {
+    } catch {
       setMessage('Error saving settings')
       setTimeout(() => setMessage(''), 3000)
     } finally {
@@ -231,10 +140,10 @@ export default function SettingsPage() {
     const config = settings.providers[provider]
     const info = providerInfo[provider]
     
-    if (info.fields.includes('apiKey') && !config?.apiKey) {
+    if (info.fields.includes('vllmUrl') && !config?.vllmUrl) {
       return false
     }
-    if (info.fields.includes('vllmUrl') && !config?.vllmUrl) {
+    if (info.fields.includes('modelName') && !config?.modelName) {
       return false
     }
     return true
@@ -321,25 +230,6 @@ export default function SettingsPage() {
             <div className="space-y-6 bg-card p-6 rounded-lg border border-border">
               <p className="text-sm text-muted-foreground">{currentProvider.description}</p>
 
-              {/* API Key Field */}
-              {currentProvider.fields.includes('apiKey') && (
-                <div>
-                  <label className="block text-sm font-medium mb-2">
-                    API Key
-                  </label>
-                  <input
-                    type="password"
-                    value={currentConfig?.apiKey || ''}
-                    onChange={(e) => handleConfigChange('apiKey', e.target.value)}
-                    className="w-full px-4 py-2 border border-border rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent"
-                    placeholder={`Enter your ${currentProvider.name} API key`}
-                  />
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Your API key is stored locally and sent securely to the backend
-                  </p>
-                </div>
-              )}
-
               {/* vLLM URL Field */}
               {currentProvider.fields.includes('vllmUrl') && (
                 <div>
@@ -370,7 +260,7 @@ export default function SettingsPage() {
                     value={currentConfig?.modelName || ''}
                     onChange={(e) => handleConfigChange('modelName', e.target.value)}
                     className="w-full px-4 py-2 border border-border rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent"
-                    placeholder={(currentProvider as any).placeholder || currentProvider.defaults.modelName}
+                    placeholder={currentProvider.placeholder || currentProvider.defaults.modelName}
                   />
                   <p className="text-xs text-muted-foreground mt-1">
                     {editingProvider === 'vllm' 
@@ -396,8 +286,8 @@ export default function SettingsPage() {
                     </div>
                   ) : (
                     <p>
-                      You can get your API key from {currentProvider.name}'s website. 
-                      Make sure you have sufficient credits or quota for API usage.
+                      Set {currentProvider.envVar} in the backend environment. Browser storage is only used for
+                      non-secret provider and model preferences.
                     </p>
                   )}
                 </div>

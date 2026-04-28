@@ -6,6 +6,7 @@
 PORT=${1:-1234}
 TP_SIZE=${2:-4}  # tensor-parallel-size
 MODEL_PATH=${3:-"./Jan-v1-4B"}
+CONDA_ENV=${CONDA_ENV:-liteplex}
 
 # Show usage if help is requested
 if [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
@@ -33,9 +34,9 @@ echo ""
 # Activate conda environment
 if command -v conda &> /dev/null; then
     eval "$(conda shell.bash hook)"
-    conda activate perp 2>/dev/null || {
-        echo "Error: conda environment 'perp' not found"
-        echo "Create it with: conda create -n perp python=3.10 -y"
+    conda activate "$CONDA_ENV" 2>/dev/null || {
+        echo "Error: conda environment '$CONDA_ENV' not found"
+        echo "Create it with: conda create -n $CONDA_ENV python=3.10 -y"
         exit 1
     }
 fi

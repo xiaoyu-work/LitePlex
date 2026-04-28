@@ -8,12 +8,13 @@ A high-performance, Perplexity-style search assistant built with LangGraph and N
 - Streaming responses
 - Multiple LLM providers support (OpenAI, Anthropic, Google, DeepSeek, Qwen, local vLLM)
 - Modern Next.js frontend
-- API key configuration via UI
+- Provider/model selection via UI without storing API keys in the browser
 
 ## Prerequisites
 
 - Python 3.10+
-- Node.js 18+
+- Node.js 20.9+ (Node.js 24 is recommended for the current Next.js version)
+- uv
 - Google Serper API key
 - At least one LLM API key (OpenAI, Anthropic, etc.) or local LLM setup
 
@@ -29,22 +30,20 @@ cd LitePlex
 ### 2. Set up Python environment
 
 ```bash
-conda create -n liteplex python=3.10 -y
-conda activate liteplex
-pip install -r requirements.txt
+uv run --python 3.10 --with-requirements requirements.txt python -c "import liteplex"
 ```
 
 ### 3. (Optional) Install vLLM for local LLM serving
 
 ```bash
 # Linux/WSL only
-pip install -r requirements-vllm.txt
+uv pip install -r requirements-vllm.txt
 ```
 
 ### 4. Set up Frontend
 ```bash
 cd frontend
-npm install
+npm ci
 cd ..
 ```
 
@@ -67,7 +66,7 @@ LitePlex supports multiple LLM backends. Choose one that suits your needs:
 | Alibaba Qwen | `DASHSCOPE_API_KEY` | Qwen models |
 | Local Server | - | vLLM, Ollama, LM Studio, llama.cpp (any OpenAI-compatible API) |
 
-You can also configure API keys directly in the web UI (Settings page).
+API keys are read only from the backend environment. The Settings page stores non-secret provider, model, and local server URL preferences in browser storage.
 
 ## Usage
 
@@ -93,13 +92,13 @@ Then open http://localhost:3000 in your browser.
 
 #### 2. Start Backend API
 ```bash
-python web_app.py
+uv run --python 3.10 --with-requirements requirements.txt python web_app.py
 ```
 The API will run on http://localhost:8088 by default.
 
 You can customize the host and port using environment variables:
 ```bash
-BACKEND_HOST=127.0.0.1 BACKEND_PORT=8080 python web_app.py
+BACKEND_HOST=127.0.0.1 BACKEND_PORT=8080 uv run --python 3.10 --with-requirements requirements.txt python web_app.py
 ```
 
 #### 3. Start Frontend
@@ -112,7 +111,7 @@ The UI will be available at http://localhost:3000
 ### CLI Usage
 For command-line interface:
 ```bash
-python liteplex.py
+uv run --python 3.10 --with-requirements requirements.txt python liteplex.py
 ```
 
 ## Configuration
@@ -138,8 +137,24 @@ BACKEND_PORT=8088
 BACKEND_HOST=0.0.0.0
 
 # Frontend Backend URL (optional, for deployment)
-# Set this if the backend is not running on localhost:8088
-# NEXT_PUBLIC_BACKEND_URL=http://localhost:8088
+# Server-side URL used by the Next.js API route
+# BACKEND_URL=http://localhost:8088
+
+# Allowed browser origins for backend CORS (comma-separated)
+# FRONTEND_ORIGINS=http://localhost:3000
+```
+
+## Quality checks
+
+```bash
+uv run --python 3.10 python -m py_compile web_app.py liteplex.py
+
+cd frontend
+npm ci
+npm audit --omit=dev --audit-level=low
+npm run lint
+npm run type-check
+npm run build
 ```
 
 ## License

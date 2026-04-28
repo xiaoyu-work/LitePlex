@@ -1,7 +1,6 @@
 'use client'
 
 import { useParams, useSearchParams } from 'next/navigation'
-import { useEffect } from 'react'
 import ChatInterface from '@/components/ChatInterface'
 
 export default function SearchPage() {

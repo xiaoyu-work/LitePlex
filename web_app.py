@@ -6,12 +6,10 @@ LitePlex API Backend Server
 from flask import Flask, request, Response, stream_with_context, jsonify
 from flask_cors import CORS
 import json
-import time
-import re
 import threading
 import uuid
 import os
-from liteplex import PerplexityAssistant, set_llm_config, set_search_config
+from liteplex import PerplexityAssistant
 import logging
 from dotenv import load_dotenv
 
@@ -30,7 +28,12 @@ liteplex_logger = logging.getLogger('liteplex')
 liteplex_logger.setLevel(logging.INFO)
 
 app = Flask(__name__)
-CORS(app)
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv('FRONTEND_ORIGINS', 'http://localhost:3000').split(',')
+    if origin.strip()
+]
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
 # Global assistant instance
 assistant = None
@@ -66,29 +69,27 @@ def index():
 def chat():
     """Handle chat requests with streaming"""
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
         
         # Get messages from request
         messages = data.get('messages', [])
-        if not messages:
+        if not isinstance(messages, list) or not messages:
             return jsonify({'error': 'No messages provided'}), 400
         
         # Get the last user message
-        message = messages[-1].get('content', '')
-        if not message:
+        last_message = messages[-1] if isinstance(messages[-1], dict) else {}
+        message = last_message.get('content', '')
+        if not isinstance(message, str) or not message.strip():
             return jsonify({'error': 'No message content'}), 400
         
         # Get LLM configuration if provided
         llm_config = data.get('llmConfig')
         if llm_config:
-            logger.info(f"📡 Received LLM config from frontend:")
+            logger.info("📡 Received request LLM config:")
             logger.info(f"  - Provider: {llm_config.get('provider', 'not set')}")
             logger.info(f"  - Model: {llm_config.get('modelName', 'not set')}")
-            logger.info(f"  - API Key: {'✓ Provided' if llm_config.get('apiKey') else '✗ Missing'}")
             if llm_config.get('vllmUrl'):
                 logger.info(f"  - vLLM URL: {llm_config.get('vllmUrl')}")
-            # Pass the config to the assistant
-            set_llm_config(llm_config)
         else:
             logger.warning("⚠️ No LLM config received from frontend, using defaults")
         
@@ -98,7 +99,6 @@ def chat():
             logger.info(f"🔍 Received search config from frontend:")
             logger.info(f"  - Num queries: {search_config.get('numQueries', 'not set')}")
             logger.info(f"  - Memory enabled: {search_config.get('memoryEnabled', 'not set')}")
-            set_search_config(search_config)
         
         session_id = data.get('sessionId', str(uuid.uuid4()))  # Get or generate session ID
         
@@ -117,7 +117,13 @@ def chat():
             sources_data = []
 
             try:
-                for chunk in assistant.stream_chat(message, stop_event):
+                for chunk in assistant.stream_chat(
+                    message.strip(),
+                    stop_event,
+                    llm_config=llm_config,
+                    search_config=search_config,
+                    request_messages=messages
+                ):
                     # Check for status signals
                     if chunk.startswith("STATUS:"):
                         status = chunk.replace("STATUS:", "").lower()
@@ -153,8 +159,13 @@ def chat():
                             logger.error(f"Failed to parse sources: {e}")
                         continue
 
+                    if chunk.startswith("Error:"):
+                        error_message = chunk.replace("Error:", "", 1).strip() or "Generation failed"
+                        yield f"data: {json.dumps({'type': 'error', 'error': error_message})}\n\n"
+                        continue
+
                     # Legacy: handle raw content (non-prefixed)
-                    if chunk and not chunk.startswith("Error:"):
+                    if chunk:
                         full_response += chunk
                         yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
                 
@@ -178,6 +189,7 @@ def chat():
             except Exception as e:
                 logger.error(f"Error during streaming for session {session_id}: {e}")
                 stop_event.set()
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Generation failed'})}\n\n"
             finally:
                 # Clean up the request from active_requests
                 with active_requests_lock:
@@ -203,7 +215,7 @@ def chat():
 def stop_generation():
     """Stop generation for a specific session"""
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
         session_id = data.get('sessionId')
         
         if not session_id:
@@ -227,13 +239,15 @@ def stop_generation():
 def update_config():
     """Update LLM configuration"""
     try:
-        config = request.json
-        logger.info(f"Updating LLM config: {config}")
-        
-        # Store the configuration
-        set_llm_config(config)
-        
-        return jsonify({'status': 'success', 'message': 'Configuration updated'})
+        config = request.get_json(silent=True) or {}
+        provider = config.get('provider', 'not set') if isinstance(config, dict) else 'not set'
+        model = config.get('modelName', 'not set') if isinstance(config, dict) else 'not set'
+        logger.info(f"Received config check: provider={provider}, model={model}")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Configuration accepted. Send it with /api/chat requests to use it.'
+        })
     except Exception as e:
         logger.error(f"Config update error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -249,40 +263,9 @@ def ensure_assistant():
     init_assistant()
 
 if __name__ == '__main__':
-    import subprocess
-    import sys
-    
     # Get configuration from environment variables
     BACKEND_HOST = os.getenv('BACKEND_HOST', '0.0.0.0')
     BACKEND_PORT = int(os.getenv('BACKEND_PORT', '8088'))
-    
-    # Kill any existing process on the configured port (cross-platform)
-    try:
-        if sys.platform == 'win32':
-            result = subprocess.run(
-                ['netstat', '-ano'], capture_output=True, text=True
-            )
-            for line in result.stdout.splitlines():
-                if f':{BACKEND_PORT}' in line and 'LISTENING' in line:
-                    pid = line.strip().split()[-1]
-                    try:
-                        subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True)
-                        print(f"Killed existing process on port {BACKEND_PORT} (PID: {pid})")
-                    except Exception:
-                        pass
-        else:
-            result = subprocess.run(['lsof', f'-ti:{BACKEND_PORT}'], capture_output=True, text=True)
-            if result.stdout.strip():
-                pids = result.stdout.strip().split('\n')
-                for pid in pids:
-                    try:
-                        subprocess.run(['kill', '-9', pid])
-                        print(f"Killed existing process on port {BACKEND_PORT} (PID: {pid})")
-                    except Exception:
-                        pass
-        time.sleep(1)
-    except Exception:
-        pass
     
     print(f"""
 ╔═══════════════════════════════════════════════════════╗
@@ -294,7 +277,7 @@ Starting API server on http://{BACKEND_HOST}:{BACKEND_PORT}
 📌 This is the API backend only!
 🖥️  To use the web interface, run the frontend:
     cd frontend
-    npm install
+    npm ci
     npm run dev
     
 Then open http://localhost:3000 in your browser

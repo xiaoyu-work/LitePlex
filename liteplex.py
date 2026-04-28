@@ -5,17 +5,16 @@ Using proper LangChain tool calling pattern
 """
 
 import json
-import http.client
-import requests
+import contextvars
 import time
-import threading
 import os
-from typing import TypedDict, Sequence, Literal, List, Union, Dict
+from typing import Any, TypedDict, Sequence, Literal, List, Dict, Optional
 from typing_extensions import Annotated
+import httpx
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
@@ -31,14 +30,21 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global LLM configuration (can be updated dynamically)
-CURRENT_LLM_CONFIG = None
+ALLOWED_LLM_PROVIDERS = {"vllm", "openai", "anthropic", "google", "deepseek", "qwen"}
 
-# Global search configuration
-SEARCH_CONFIG = {
+DEFAULT_SEARCH_CONFIG = {
     'num_queries': 5,  # Default number of parallel queries (1-6)
     'memory_enabled': True  # Whether to use conversation history (5 Q&A pairs)
 }
+
+CURRENT_LLM_CONFIG: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "liteplex_llm_config",
+    default=None
+)
+CURRENT_SEARCH_CONFIG: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "liteplex_search_config",
+    default=DEFAULT_SEARCH_CONFIG
+)
 
 # Configuration
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
@@ -53,39 +59,74 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 
-# Validate required environment variables
+# Warn early but allow the app to start so health/config endpoints still work.
 if not SERPER_API_KEY:
-    raise ValueError("SERPER_API_KEY not found in environment variables. Please set it in .env file.")
+    logger.warning("SERPER_API_KEY not found. Web search requests will fail until it is configured.")
+
+
+def sanitize_llm_config(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a request-scoped LLM config without accepting browser-supplied secrets."""
+    if not config:
+        return None
+
+    provider = str(config.get('provider', LLM_PROVIDER)).lower()
+    if provider not in ALLOWED_LLM_PROVIDERS:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+
+    sanitized = {
+        'provider': provider,
+        'model_name': str(config.get('modelName') or MODEL_NAME),
+        'vllm_url': str(config.get('vllmUrl') or VLLM_URL)
+    }
+
+    return sanitized
+
+
+def sanitize_search_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize user-tunable search settings for the current request."""
+    sanitized = dict(DEFAULT_SEARCH_CONFIG)
+    if not config:
+        return sanitized
+
+    try:
+        num_queries = int(config.get('numQueries', sanitized['num_queries']))
+    except (TypeError, ValueError):
+        num_queries = sanitized['num_queries']
+
+    sanitized['num_queries'] = min(max(num_queries, 1), 6)
+    sanitized['memory_enabled'] = bool(config.get('memoryEnabled', sanitized['memory_enabled']))
+    return sanitized
+
+
+def get_current_search_config() -> Dict[str, Any]:
+    return dict(CURRENT_SEARCH_CONFIG.get())
 
 def set_llm_config(config):
-    """Update the global LLM configuration from frontend"""
-    global CURRENT_LLM_CONFIG
-    CURRENT_LLM_CONFIG = config
-    logger.info(f"LLM config updated: provider={config.get('provider', 'unknown')}")
+    """Set request-local LLM configuration and ignore browser-supplied API keys."""
+    sanitized = sanitize_llm_config(config)
+    CURRENT_LLM_CONFIG.set(sanitized)
+    if sanitized:
+        logger.info(f"LLM config set for request: provider={sanitized.get('provider', 'unknown')}")
+    return sanitized
 
 def set_search_config(config):
-    """Update the global search configuration from frontend"""
-    global SEARCH_CONFIG
-    # Frontend dropdown ensures 1-6, so just use the value directly
-    SEARCH_CONFIG['num_queries'] = config.get('numQueries', 5)
-    SEARCH_CONFIG['memory_enabled'] = config.get('memoryEnabled', True)
-    
-    logger.info(f"Search config updated: queries={SEARCH_CONFIG['num_queries']}, "
-                f"memory={SEARCH_CONFIG['memory_enabled']}")
+    """Set request-local search configuration."""
+    sanitized = sanitize_search_config(config)
+    CURRENT_SEARCH_CONFIG.set(sanitized)
+    logger.info(f"Search config set for request: queries={sanitized['num_queries']}, "
+                f"memory={sanitized['memory_enabled']}")
+    return sanitized
 
 def get_llm_provider_config():
-    """Get the current LLM provider configuration"""
-    global CURRENT_LLM_CONFIG
-    
-    # Use frontend config if available
-    if CURRENT_LLM_CONFIG:
-        provider = CURRENT_LLM_CONFIG.get('provider', 'vllm')
-        
+    """Get the current request's LLM provider configuration."""
+    llm_config = CURRENT_LLM_CONFIG.get()
+
+    if llm_config:
         return {
-            'provider': provider,
-            'api_key': CURRENT_LLM_CONFIG.get('apiKey'),
-            'model_name': CURRENT_LLM_CONFIG.get('modelName', MODEL_NAME),
-            'vllm_url': CURRENT_LLM_CONFIG.get('vllmUrl', VLLM_URL)
+            'provider': llm_config['provider'],
+            'api_key': None,
+            'model_name': llm_config['model_name'],
+            'vllm_url': llm_config['vllm_url']
         }
     
     # Fall back to environment variables
@@ -109,27 +150,26 @@ def extract_domain(url: str) -> str:
 # Helper function to search single query
 def search_single_query(query: str, num_results: int = 10) -> Dict:
     """Execute a single search query"""
-    try:
-        conn = http.client.HTTPSConnection("google.serper.dev")
-        payload = json.dumps({"q": query, "num": num_results})
-        headers = {
+    if not SERPER_API_KEY:
+        raise RuntimeError("SERPER_API_KEY is not configured")
+
+    response = httpx.post(
+        "https://google.serper.dev/search",
+        json={"q": query, "num": num_results},
+        headers={
             'X-API-KEY': SERPER_API_KEY,
             'Content-Type': 'application/json'
-        }
-        conn.request("POST", "/search", payload, headers)
-        res = conn.getresponse()
-        data = res.read()
-        result = json.loads(data.decode("utf-8"))
-        conn.close()
-        
-        return {
-            'query': query,
-            'results': result.get('organic', []),
-            'answerBox': result.get('answerBox', None)
-        }
-    except Exception as e:
-        logger.error(f"Error searching '{query}': {e}")
-        return {'query': query, 'results': [], 'answerBox': None}
+        },
+        timeout=httpx.Timeout(5.0, connect=2.0)
+    )
+    response.raise_for_status()
+    result = response.json()
+
+    return {
+        'query': query,
+        'results': result.get('organic', []),
+        'answerBox': result.get('answerBox', None)
+    }
 
 # Helper function to deduplicate results by domain
 def deduplicate_by_domain(all_results: List[Dict]) -> List[Dict]:
@@ -158,14 +198,18 @@ class GoogleSearchInput(BaseModel):
     @classmethod
     def validate_queries_count(cls, v: List[str]) -> List[str]:
         # Adjust to configured number of queries
-        target_count = SEARCH_CONFIG.get('num_queries', 5)
-        if len(v) < target_count:
+        target_count = get_current_search_config().get('num_queries', 5)
+        queries = [query.strip() for query in v if isinstance(query, str) and query.strip()]
+        if not queries:
+            raise ValueError("At least one non-empty search query is required")
+
+        if len(queries) < target_count:
             # Pad with variations of existing queries
-            while len(v) < target_count:
-                v.append(v[0] if v else "")
-        elif len(v) > target_count:
-            v = v[:target_count]
-        return v
+            while len(queries) < target_count:
+                queries.append(queries[0])
+        elif len(queries) > target_count:
+            queries = queries[:target_count]
+        return queries
 
 # Main search tool - now accepts multiple queries
 @tool(args_schema=GoogleSearchInput)
@@ -182,9 +226,12 @@ def google_search(queries: List[str]) -> str:
     # Validate input
     if not isinstance(queries, list):
         queries = [queries] if isinstance(queries, str) else []
+    queries = [query.strip() for query in queries if isinstance(query, str) and query.strip()]
+    if not queries:
+        return json.dumps({'text': "Search failed: no valid search queries were provided.", 'sources': []})
     
     # Adjust to configured number of queries
-    target_count = SEARCH_CONFIG.get('num_queries', 5)
+    target_count = get_current_search_config().get('num_queries', 5)
     if len(queries) < target_count:
         logger.info(f"📝 Expanding to {target_count} queries (received {len(queries)})")
         while len(queries) < target_count:
@@ -201,6 +248,7 @@ def google_search(queries: List[str]) -> str:
         # Parallel execution for maximum speed
         all_results = []
         all_answer_boxes = []
+        errors = []
         
         with ThreadPoolExecutor(max_workers=6) as executor:
             # Submit all queries at once
@@ -220,9 +268,13 @@ def google_search(queries: List[str]) -> str:
                     logger.info(f"✅ Query completed: '{query}' - {len(result['results'])} results")
                 except Exception as e:
                     logger.error(f"❌ Query failed: '{query}' - {e}")
+                    errors.append(str(e))
         
         parallel_time = time.time() - start_time
         logger.info(f"⏱️  [PARALLEL SEARCH] All queries completed in: {parallel_time:.2f}s")
+
+        if not all_results and not all_answer_boxes and errors:
+            return json.dumps({'text': f"Search failed: {errors[0]}", 'sources': []})
         
         # Deduplicate by domain
         dedup_start = time.time()
@@ -295,7 +347,6 @@ def create_llm_with_tools():
     
     logger.info(f"🔧 Creating LLM with provider: {provider}")
     logger.info(f"📝 Model: {model_name}")
-    logger.info(f"🔑 API Key configured: {'Yes' if config.get('api_key') else 'No'}")
     if provider == "vllm":
         logger.info(f"🌐 vLLM URL: {config.get('vllm_url')}")
     
@@ -329,11 +380,9 @@ def create_llm_with_tools():
         api_key = config['api_key'] or GOOGLE_API_KEY
         if not api_key:
             logger.error("❌ Google API key not configured!")
-            raise ValueError("Google API key not configured. Please set it in the settings.")
+            raise ValueError("Google API key not configured. Please set GOOGLE_API_KEY in the backend environment.")
         logger.info(f"🌟 Using Google Gemini")
         logger.info(f"  - Model: {model_name}")
-        logger.info(f"  - API Key length: {len(api_key)} chars")
-        logger.info(f"  - API Key prefix: {api_key[:10]}..." if api_key else "No key")
         try:
             llm = ChatGoogleGenerativeAI(
                 google_api_key=api_key,
@@ -1038,11 +1087,8 @@ def create_perplexity_graph():
     # Initialize workflow
     workflow = StateGraph(AgentState)
     
-    # Get tools for ToolNode
-    _, tools = create_llm_with_tools()
-    
     # Create ToolNode with our tools
-    tool_node = ToolNode(tools)
+    tool_node = ToolNode([google_search])
     
     # Add nodes
     workflow.add_node("agent", agent_node)
@@ -1101,7 +1147,7 @@ class PerplexityAssistant:
         self.message_history.append(user_msg)
         
         # Create initial state with conversation history based on config
-        if SEARCH_CONFIG.get('memory_enabled', True):
+        if get_current_search_config().get('memory_enabled', True):
             # Keep last 5 questions (10 messages: 5 user + 5 assistant)
             messages_to_include = self.message_history[-10:]
         else:
@@ -1140,24 +1186,73 @@ class PerplexityAssistant:
         response = final_message.content
         
         return response
-    
-    def stream_chat(self, user_input: str, stop_event=None):
+
+    @staticmethod
+    def _messages_from_request(request_messages, fallback_user_input: str) -> List[BaseMessage]:
+        """Convert frontend chat history into LangChain messages without storing it globally."""
+        converted: List[BaseMessage] = []
+
+        if isinstance(request_messages, list):
+            for item in request_messages:
+                if not isinstance(item, dict):
+                    continue
+
+                role = item.get('role')
+                content = item.get('content')
+                if not isinstance(content, str) or not content.strip():
+                    continue
+
+                if role == 'user':
+                    converted.append(HumanMessage(content=content))
+                elif role == 'assistant':
+                    converted.append(AIMessage(content=content))
+
+        if not converted:
+            return [HumanMessage(content=fallback_user_input)]
+
+        return converted
+
+    def stream_chat(
+        self,
+        user_input: str,
+        stop_event=None,
+        llm_config: Optional[Dict[str, Any]] = None,
+        search_config: Optional[Dict[str, Any]] = None,
+        request_messages=None
+    ):
+        """Stream chat with request-local configuration that is reset when streaming ends."""
+        llm_token = CURRENT_LLM_CONFIG.set(sanitize_llm_config(llm_config))
+        search_token = CURRENT_SEARCH_CONFIG.set(sanitize_search_config(search_config))
+
+        try:
+            yield from self._stream_chat_impl(user_input, stop_event, request_messages)
+        finally:
+            CURRENT_LLM_CONFIG.reset(llm_token)
+            CURRENT_SEARCH_CONFIG.reset(search_token)
+
+    def _stream_chat_impl(self, user_input: str, stop_event=None, request_messages=None):
         """
         Stream the chat response with cancellation support - with real streaming
         """
         overall_start = time.time()
-        
-        # Add user message to history
+
+        use_request_history = request_messages is not None
         user_msg = HumanMessage(content=user_input)
-        self.message_history.append(user_msg)
-        
+
+        if use_request_history:
+            history_messages = self._messages_from_request(request_messages, user_input)
+        else:
+            # CLI mode keeps local history; web requests pass history explicitly.
+            self.message_history.append(user_msg)
+            history_messages = self.message_history
+
         # Create initial state with conversation history based on config
-        if SEARCH_CONFIG.get('memory_enabled', True):
+        if get_current_search_config().get('memory_enabled', True):
             # Keep last 5 questions (10 messages: 5 user + 5 assistant)
-            messages_to_include = self.message_history[-10:]
+            messages_to_include = history_messages[-10:]
         else:
             # No history, just current message
-            messages_to_include = [user_msg]
+            messages_to_include = [history_messages[-1] if history_messages else user_msg]
         
         initial_state = {
             "messages": messages_to_include,
@@ -1248,7 +1343,7 @@ class PerplexityAssistant:
                         yield f"Error: {content}"
 
             # Store in history
-            if full_content:
+            if full_content and not use_request_history:
                 final_msg = AIMessage(content=full_content)
                 self.message_history.append(final_msg)
                 self.conversation_history.append({

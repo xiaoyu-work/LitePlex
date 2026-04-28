@@ -13,22 +13,10 @@ interface CollapsibleSourcesProps {
 
 export const CollapsibleSources: React.FC<CollapsibleSourcesProps> = ({ sources }) => {
   const [isOpen, setIsOpen] = useState(true); // Default to open
-
-  console.log('CollapsibleSources component received:', sources);
   
   if (!sources || sources.length === 0) {
-    console.log('CollapsibleSources: No sources to display');
     return null;
   }
-
-  const getFaviconUrl = (url: string) => {
-    try {
-      const domain = new URL(url).hostname;
-      return `https://www.google.com/s2/favicons?sz=128&domain=${domain}`;
-    } catch {
-      return null;
-    }
-  };
 
   const getHostname = (url: string) => {
     try {
@@ -97,22 +85,9 @@ export const CollapsibleSources: React.FC<CollapsibleSourcesProps> = ({ sources 
                   hover:bg-muted/50 rounded-lg
                 ">
                   <div className="flex items-start gap-3">
-                    {/* Favicon */}
+                    {/* Source icon */}
                     <div className="relative w-6 h-6 rounded-sm flex items-center justify-center overflow-hidden shrink-0 mt-0.5">
-                      {getFaviconUrl(source.url) ? (
-                        <img
-                          src={getFaviconUrl(source.url)!}
-                          alt=""
-                          width={16}
-                          height={16}
-                          className="object-contain"
-                          onError={(e) => {
-                            e.currentTarget.style.display = 'none';
-                          }}
-                        />
-                      ) : (
-                        <Globe className="w-4 h-4 text-muted-foreground" />
-                      )}
+                      <Globe className="w-4 h-4 text-muted-foreground" />
                     </div>
 
                     {/* Content */}

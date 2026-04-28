@@ -2,17 +2,21 @@
 
 import { Moon, Sun, Monitor } from 'lucide-react'
 import { useTheme } from 'next-themes'
-import { useEffect, useState } from 'react'
+import { useState, useSyncExternalStore } from 'react'
 import { cn } from '@/lib/utils'
 
+function useIsClient() {
+  return useSyncExternalStore(
+    () => () => undefined,
+    () => true,
+    () => false
+  )
+}
+
 export function ThemeToggle() {
-  const [mounted, setMounted] = useState(false)
+  const mounted = useIsClient()
   const { theme, setTheme } = useTheme()
   const [isOpen, setIsOpen] = useState(false)
-
-  useEffect(() => {
-    setMounted(true)
-  }, [])
 
   if (!mounted) {
     return (

@@ -1,11 +1,11 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Navbar from './Navbar'
 import ChatInput from './ChatInput'
 import { CollapsibleSources } from './CollapsibleSources'
 import { MemoizedMarkdown } from './MemoizedMarkdown'
-import { FormEvent } from 'react'
+import { sanitizeActiveLLMConfig } from '@/lib/llm-settings'
 
 interface ChatInterfaceProps {
   chatId: string
@@ -29,6 +29,28 @@ interface Message {
 
 type WorkflowStatus = 'thinking' | 'searching' | 'summarizing' | null
 
+function createId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function readStoredLLMConfig() {
+  const llmConfig = localStorage.getItem('llmConfig')
+  if (!llmConfig) {
+    return null
+  }
+
+  try {
+    return sanitizeActiveLLMConfig(JSON.parse(llmConfig))
+  } catch (error) {
+    console.error('Failed to parse saved LLM config:', error)
+    return null
+  }
+}
+
 export default function ChatInterface({ chatId, initialQuery }: ChatInterfaceProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const [messages, setMessages] = useState<Message[]>(() => {
@@ -48,9 +70,22 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [currentStatus, setCurrentStatus] = useState<WorkflowStatus>(null)
-  const [hasInitialized, setHasInitialized] = useState(false)
+  const hasInitializedRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
-  
+  const activeSessionIdRef = useRef<string | null>(null)
+
+  const updateLastAssistantMessage = useCallback((updater: (message: Message) => Message) => {
+    setMessages(prev => {
+      const lastIndex = prev.length - 1
+      const lastMessage = prev[lastIndex]
+
+      if (!lastMessage || lastMessage.role !== 'assistant') {
+        return prev
+      }
+
+      return prev.map((message, index) => index === lastIndex ? updater(message) : message)
+    })
+  }, [])
 
   // Save messages to sessionStorage whenever they change
   useEffect(() => {
@@ -64,50 +99,19 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // Handle initial query - auto-submit if coming from landing page
-  useEffect(() => {
-    console.log('Initial query effect:', { 
-      initialQuery, 
-      hasInitialized, 
-      referrer: document.referrer,
-      chatId 
-    })
-    
-    if (initialQuery && !hasInitialized) {
-      setHasInitialized(true)
-      setInput(initialQuery)
-      
-      // Check if we already submitted this query
-      const alreadySubmitted = sessionStorage.getItem(`chat-submitted-${chatId}`)
-      console.log('Already submitted?', alreadySubmitted)
-      
-      if (!alreadySubmitted) {
-        // Mark as submitted and auto-submit
-        sessionStorage.setItem(`chat-submitted-${chatId}`, 'true')
-        
-        // Auto-submit immediately
-        console.log('Auto-submitting query:', initialQuery)
-        sendMessage(initialQuery)
-      } else {
-        console.log('Not auto-submitting (already submitted or refresh)')
-      }
-    }
-  }, [initialQuery])
-
-  const sendMessage = async (messageText: string) => {
-    console.log('sendMessage called with:', messageText, 'isLoading:', isLoading)
-    
+  const sendMessage = useCallback(async (messageText: string) => {
     if (!messageText.trim() || isLoading) {
-      console.log('sendMessage blocked - empty text or loading')
       return
     }
     
     // Create abort controller for this request
     abortControllerRef.current = new AbortController()
+    const sessionId = createId()
+    activeSessionIdRef.current = sessionId
     
     // Add user message
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: createId(),
       role: 'user',
       content: messageText,
       timestamp: new Date()
@@ -119,9 +123,8 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
     setCurrentStatus('thinking')
     
     // Add assistant message placeholder
-    const assistantMessageId = (Date.now() + 1).toString()
     const assistantMessage: Message = {
-      id: assistantMessageId,
+      id: createId(),
       role: 'assistant',
       content: '',
       thinking: '',
@@ -130,9 +133,7 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
     
     setMessages(prev => [...prev, assistantMessage])
     
-    // Get LLM configuration from localStorage
-    const llmConfig = localStorage.getItem('llmConfig')
-    const config = llmConfig ? JSON.parse(llmConfig) : null
+    const config = readStoredLLMConfig()
     
     try {
       const response = await fetch('/api/chat', {
@@ -145,6 +146,8 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
             role: m.role,
             content: m.content
           })),
+          chatId,
+          sessionId,
           llmConfig: config
         }),
         signal: abortControllerRef.current.signal
@@ -158,8 +161,9 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
       if (!reader) throw new Error('No reader available')
       
       let buffer = ''
+      let streamDone = false
       
-      while (true) {
+      while (!streamDone) {
         const { done, value } = await reader.read()
         if (done) break
         
@@ -176,58 +180,32 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
             const data = line.slice(6).trim()
             
             if (data === '[DONE]') {
-              console.log('Stream completed')
+              streamDone = true
               break
             }
             
             try {
               const parsed = JSON.parse(data)
-              // Log important events
-              if (parsed.type === 'sources' || parsed.type === 'done') {
-                console.log(`Event type: ${parsed.type}`, parsed)
-              }
-              
+               
               // Handle different event types
               if (parsed.type === 'content' || parsed.type === 'text-delta') {
-                setMessages(prev => {
-                  const newMessages = [...prev]
-                  const lastMessage = newMessages[newMessages.length - 1]
-                  if (lastMessage.role === 'assistant') {
-                    lastMessage.content += parsed.content || parsed.delta || ''
-                  }
-                  return newMessages
-                })
+                const delta = parsed.content || parsed.delta || ''
+                updateLastAssistantMessage(message => ({
+                  ...message,
+                  content: message.content + delta
+                }))
               } else if (parsed.type === 'sources') {
                 // Handle sources sent at the end
-                console.log('Received sources:', parsed.sources)
-                console.log('Sources count:', parsed.sources?.length)
-                setMessages(prev => {
-                  const newMessages = [...prev]
-                  const lastMessage = newMessages[newMessages.length - 1]
-                  if (lastMessage.role === 'assistant') {
-                    // Create a new message object to trigger re-render
-                    const updatedMessage = {
-                      ...lastMessage,
-                      sources: parsed.sources
-                    }
-                    newMessages[newMessages.length - 1] = updatedMessage
-                    console.log('Updated message with sources:', updatedMessage)
-                    console.log('Sources in updated message:', updatedMessage.sources)
-                    // Force a re-render by returning a completely new array
-                    return [...newMessages]
-                  }
-                  return prev
-                })
+                updateLastAssistantMessage(message => ({
+                  ...message,
+                  sources: parsed.sources
+                }))
               } else if (parsed.type === 'thinking') {
                 // Handle thinking content
-                setMessages(prev => {
-                  const newMessages = [...prev]
-                  const lastMessage = newMessages[newMessages.length - 1]
-                  if (lastMessage.role === 'assistant') {
-                    lastMessage.thinking = (lastMessage.thinking || '') + (parsed.content || '')
-                  }
-                  return newMessages
-                })
+                updateLastAssistantMessage(message => ({
+                  ...message,
+                  thinking: (message.thinking || '') + (parsed.content || '')
+                }))
               } else if (parsed.type === 'status') {
                 // Update status
                 if (parsed.status === 'searching') {
@@ -235,41 +213,75 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
                 } else if (parsed.status === 'summarizing') {
                   setCurrentStatus('summarizing')
                 }
+              } else if (parsed.type === 'error') {
+                updateLastAssistantMessage(message => ({
+                  ...message,
+                  content: parsed.error || 'Sorry, an error occurred. Please try again.'
+                }))
               }
             } catch (e) {
-              // Not JSON, might be raw text
-              console.log('Raw data:', data)
+              console.error('Failed to parse stream data:', e)
             }
           }
         }
       }
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        console.log('Request aborted')
-      } else {
+    } catch (error) {
+      const isAbortError = error instanceof DOMException && error.name === 'AbortError'
+      if (!isAbortError) {
         console.error('Error:', error)
-        setMessages(prev => {
-          const newMessages = [...prev]
-          const lastMessage = newMessages[newMessages.length - 1]
-          if (lastMessage.role === 'assistant') {
-            lastMessage.content = 'Sorry, an error occurred. Please try again.'
-          }
-          return newMessages
-        })
+        updateLastAssistantMessage(message => ({
+          ...message,
+          content: 'Sorry, an error occurred. Please try again.'
+        }))
       }
     } finally {
       setIsLoading(false)
       setCurrentStatus(null)
       abortControllerRef.current = null
+      activeSessionIdRef.current = null
     }
-  }
+  }, [chatId, isLoading, messages, updateLastAssistantMessage])
 
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault()
+  // Handle initial query - auto-submit if coming from landing page
+  useEffect(() => {
+    if (initialQuery && !hasInitializedRef.current) {
+      hasInitializedRef.current = true
+
+      // Check if we already submitted this query
+      const alreadySubmitted = sessionStorage.getItem(`chat-submitted-${chatId}`)
+      
+      if (!alreadySubmitted) {
+        // Mark as submitted and auto-submit
+        sessionStorage.setItem(`chat-submitted-${chatId}`, 'true')
+        
+        const timeoutId = window.setTimeout(() => {
+          sendMessage(initialQuery)
+        }, 0)
+
+        return () => window.clearTimeout(timeoutId)
+      }
+    }
+  }, [chatId, initialQuery, sendMessage])
+
+  const handleSubmit = () => {
     sendMessage(input)
   }
 
   const stopGeneration = () => {
+    const sessionId = activeSessionIdRef.current
+
+    if (sessionId) {
+      void fetch('/api/stop', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ sessionId }),
+      }).catch((error) => {
+        console.error('Failed to stop backend generation:', error)
+      })
+    }
+
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
     }
@@ -375,10 +387,7 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
                     
                     {/* Collapsible Sources - show when available */}
                     {message.sources && message.sources.length > 0 && (
-                      <>
-                        {console.log('Rendering CollapsibleSources with:', message.sources)}
-                        <CollapsibleSources sources={message.sources} />
-                      </>
+                      <CollapsibleSources sources={message.sources} />
                     )}
                     </>
                   )}

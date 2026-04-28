@@ -2,7 +2,6 @@ import React, { memo, useMemo, useState, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
-import rehypeRaw from 'rehype-raw'
 import dynamic from 'next/dynamic'
 
 // Dynamically import StockChart to avoid SSR issues
@@ -26,34 +25,57 @@ function splitIntoBlocks(content: string): string[] {
   return blocks
 }
 
+function toSuperscript(value: string): string {
+  const chars: Record<string, string> = {
+    '0': '⁰',
+    '1': '¹',
+    '2': '²',
+    '3': '³',
+    '4': '⁴',
+    '5': '⁵',
+    '6': '⁶',
+    '7': '⁷',
+    '8': '⁸',
+    '9': '⁹',
+    ',': ',',
+    ' ': ' ',
+    '-': '⁻'
+  }
+
+  return value.split('').map((char) => chars[char] ?? char).join('')
+}
+
+function normalizeMarkdown(content: string): string {
+  return content.replace(/<sup>([\d,\s-]+)<\/sup>/gi, (_, citation: string) => toSuperscript(citation))
+}
+
 // Memoized block component
 const MarkdownBlock = memo(({ block }: { block: string }) => {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkBreaks]}
-      rehypePlugins={[rehypeRaw]}
       components={{
         // Custom link component to open in new tab
-        a: ({node, ...props}) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+        a: ({node: _node, ...props}) => <a {...props} target="_blank" rel="noopener noreferrer" />,
         // Ensure proper heading sizes
-        h1: ({node, ...props}) => <h1 className="text-2xl font-bold my-4" {...props} />,
-        h2: ({node, ...props}) => <h2 className="text-xl font-semibold my-3" {...props} />,
-        h3: ({node, ...props}) => <h3 className="text-lg font-semibold my-2" {...props} />,
+        h1: ({node: _node, ...props}) => <h1 className="text-2xl font-bold my-4" {...props} />,
+        h2: ({node: _node, ...props}) => <h2 className="text-xl font-semibold my-3" {...props} />,
+        h3: ({node: _node, ...props}) => <h3 className="text-lg font-semibold my-2" {...props} />,
         // Style sup tags for citations
-        sup: ({node, ...props}) => <sup className="text-xs text-blue-500 hover:text-blue-400 cursor-pointer ml-0.5" {...props} />,
+        sup: ({node: _node, ...props}) => <sup className="text-xs text-blue-500 hover:text-blue-400 cursor-pointer ml-0.5" {...props} />,
         // Properly format lists
-        ul: ({node, ...props}) => <ul className="list-disc list-inside my-2 space-y-1" {...props} />,
-        ol: ({node, ...props}) => <ol className="list-decimal list-inside my-2 space-y-1" {...props} />,
-        li: ({node, ...props}) => <li className="ml-4" {...props} />,
+        ul: ({node: _node, ...props}) => <ul className="list-disc list-inside my-2 space-y-1" {...props} />,
+        ol: ({node: _node, ...props}) => <ol className="list-decimal list-inside my-2 space-y-1" {...props} />,
+        li: ({node: _node, ...props}) => <li className="ml-4" {...props} />,
         // Code blocks
-        code: ({node, inline, ...props}) => 
-          inline ? (
+        code: ({node: _node, className, ...props}) => 
+          !className ? (
             <code className="bg-gray-800 px-1.5 py-0.5 rounded text-sm" {...props} />
           ) : (
-            <code className="block bg-gray-800 rounded-lg p-4 overflow-x-auto my-4" {...props} />
+            <code className={`${className} block bg-gray-800 rounded-lg p-4 overflow-x-auto my-4`} {...props} />
           ),
         // Paragraphs
-        p: ({node, ...props}) => <p className="my-2 leading-relaxed" {...props} />,
+        p: ({node: _node, ...props}) => <p className="my-2 leading-relaxed" {...props} />,
       }}
     >
       {block}
@@ -73,6 +95,9 @@ export const MemoizedMarkdown: React.FC<MemoizedMarkdownProps> = memo(({ content
   useEffect(() => {
     setMounted(true)
   }, [])
+
+  const normalizedContent = useMemo(() => normalizeMarkdown(content), [content])
+  const blocks = useMemo(() => splitIntoBlocks(normalizedContent), [normalizedContent])
   
   // Check if content contains stock chart directive
   const stockChartMatch = content.match(/\[STOCK_CHART:([A-Z]+)\]/)
@@ -110,9 +135,6 @@ export const MemoizedMarkdown: React.FC<MemoizedMarkdownProps> = memo(({ content
       </div>
     )
   }
-  
-  // Split content into blocks for efficient rendering
-  const blocks = useMemo(() => splitIntoBlocks(content), [content])
   
   // For streaming, we want to handle incomplete markdown gracefully
   // If the last block is incomplete (e.g., in the middle of a list), 

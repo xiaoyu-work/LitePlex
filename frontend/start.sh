@@ -6,7 +6,7 @@ echo "================================"
 # Install dependencies if needed
 if [ ! -d "node_modules" ]; then
     echo "Installing dependencies..."
-    npm install
+    npm ci
 fi
 
 # Start the development server

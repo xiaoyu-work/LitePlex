@@ -5,7 +5,7 @@ import { useRef, useEffect, FormEvent, KeyboardEvent } from 'react'
 interface ChatInputProps {
   value: string
   onChange: (value: string) => void
-  onSubmit: (e: FormEvent) => void
+  onSubmit: () => void
   onStop?: () => void
   disabled?: boolean
   isProcessing?: boolean
@@ -24,12 +24,17 @@ export default function ChatInput({ value, onChange, onSubmit, onStop, disabled,
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !isProcessing) {
       e.preventDefault()
-      onSubmit(e as any)
+      onSubmit()
     }
   }
 
+  const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    onSubmit()
+  }
+
   return (
-    <form onSubmit={onSubmit} className="relative">
+    <form onSubmit={handleSubmit} className="relative">
       <div className="bg-popover border border-border rounded-2xl transition-colors focus-within:border-ring shadow-sm">
         <div className="flex items-end gap-2 p-2">
           <div className="flex-1">

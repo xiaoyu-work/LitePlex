@@ -2,7 +2,6 @@
 
 import { useState, FormEvent } from 'react'
 import { useRouter } from 'next/navigation'
-import { v4 as uuidv4 } from 'uuid'
 import { ThemeToggle } from '@/components/ThemeToggle'
 import { SettingsDropdown } from '@/components/SettingsDropdown'
 
@@ -13,7 +12,7 @@ export default function HomePage() {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault()
     if (query.trim()) {
-      const chatId = uuidv4()
+      const chatId = crypto.randomUUID()
       router.push(`/search/${chatId}?q=${encodeURIComponent(query)}`)
     }
   }

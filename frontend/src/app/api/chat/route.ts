@@ -3,32 +3,29 @@ import { NextRequest } from 'next/server'
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    const messages = body.messages || []
+    const messages = Array.isArray(body.messages) ? body.messages : []
     const llmConfig = body.llmConfig || null
-    console.log('Received messages:', messages)
-    console.log('Received LLM config:', llmConfig)
+    const searchConfig = body.searchConfig || null
     
     // Check if messages exist and have content
-    if (!messages || messages.length === 0) {
-      throw new Error('No messages provided')
+    if (messages.length === 0) {
+      return Response.json({ error: 'No messages provided' }, { status: 400 })
     }
     
     // Get the last message (the user's new message)
     const lastMessage = messages[messages.length - 1]
     const userMessage = lastMessage?.content || ''
-    console.log('User message:', userMessage)
     
     if (!userMessage) {
-      throw new Error('No message content provided')
+      return Response.json({ error: 'No message content provided' }, { status: 400 })
     }
     
-    // Create a unique session ID for this request
-    const sessionId = Math.random().toString(36).substring(7)
-    const messageId = Math.random().toString(36).substring(7)
-    const textId = Math.random().toString(36).substring(7)
+    const sessionId = body.sessionId || crypto.randomUUID()
+    const messageId = crypto.randomUUID()
+    const textId = crypto.randomUUID()
     
     // Call your Python backend
-    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8088'
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:8088'
     const response = await fetch(`${backendUrl}/api/chat`, {
       method: 'POST',
       headers: {
@@ -36,14 +33,18 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({
         messages: messages,
-        chatId: 'default',
+        chatId: body.chatId || 'default',
         sessionId: sessionId,
-        llmConfig: llmConfig
+        llmConfig: llmConfig,
+        searchConfig: searchConfig
       }),
     })
     
     if (!response.ok) {
-      throw new Error(`Backend error: ${response.status}`)
+      return Response.json(
+        { error: `Backend error: ${response.status}` },
+        { status: response.status }
+      )
     }
     
     // Create a stream that follows AI SDK protocol
@@ -54,7 +55,7 @@ export async function POST(req: NextRequest) {
         const encoder = new TextEncoder()
         
         if (!reader) {
-          controller.close()
+          controller.error(new Error('Backend response body missing'))
           return
         }
         
@@ -71,7 +72,6 @@ export async function POST(req: NextRequest) {
         })}\n\n`))
         
         let buffer = ''
-        let isThinking = false
         
         try {
           while (true) {
@@ -92,21 +92,18 @@ export async function POST(req: NextRequest) {
                   
                   if (data.type === 'status') {
                     // Send status update
-                    console.log('Backend status:', data.status)
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                       type: 'status',
                       status: data.status
                     })}\n\n`))
                   } else if (data.type === 'thinking') {
                     // Send thinking content
-                    console.log('Backend thinking:', data.content?.substring(0, 50))
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                       type: 'thinking',
                       content: data.content
                     })}\n\n`))
                   } else if (data.type === 'content') {
                     // Send content as text delta
-                    console.log('Sending content delta:', data.content)
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                       type: 'text-delta',
                       id: textId,
@@ -114,10 +111,14 @@ export async function POST(req: NextRequest) {
                     })}\n\n`))
                   } else if (data.type === 'sources') {
                     // Send sources
-                    console.log('Backend sources:', data.sources?.length)
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                       type: 'sources',
                       sources: data.sources
+                    })}\n\n`))
+                  } else if (data.type === 'error') {
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'error',
+                      error: data.error || 'Generation failed'
                     })}\n\n`))
                   }
                 } catch (e) {
@@ -138,6 +139,10 @@ export async function POST(req: NextRequest) {
           
         } catch (error) {
           console.error('Stream reading error:', error)
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            type: 'error',
+            error: 'Stream reading error'
+          })}\n\n`))
         } finally {
           controller.close()
         }
@@ -156,12 +161,6 @@ export async function POST(req: NextRequest) {
     
   } catch (error) {
     console.error('API route error:', error)
-    return new Response(
-      JSON.stringify({ error: 'Failed to process chat request' }),
-      { 
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      }
-    )
+    return Response.json({ error: 'Failed to process chat request' }, { status: 500 })
   }
 }

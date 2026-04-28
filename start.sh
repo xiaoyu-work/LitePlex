@@ -3,21 +3,15 @@
 echo "Starting LitePlex..."
 echo "===================="
 
-# Function to kill process on port
-kill_port() {
-    port=$1
-    echo "Checking port $port..."
-    lsof -i :$port | grep LISTEN | awk '{print $2}' | xargs -r kill -9 2>/dev/null
-}
-
-# Clean up ports
-kill_port 8088
-kill_port 3000
+if ! command -v uv >/dev/null 2>&1; then
+    echo "Error: uv is required. Install it from https://docs.astral.sh/uv/"
+    exit 1
+fi
 
 # Start backend
 echo ""
 echo "Starting backend API server on port 8088..."
-python web_app.py &
+uv run --python 3.10 --with-requirements requirements.txt python web_app.py &
 BACKEND_PID=$!
 
 # Wait for backend to start
@@ -27,7 +21,9 @@ sleep 2
 echo ""
 echo "Starting frontend on port 3000..."
 cd frontend
-npm install --silent 2>/dev/null
+if [ ! -d "node_modules" ]; then
+    npm ci
+fi
 npm run dev &
 FRONTEND_PID=$!
 
@@ -47,8 +43,6 @@ cleanup() {
     echo "Stopping services..."
     kill $BACKEND_PID 2>/dev/null
     kill $FRONTEND_PID 2>/dev/null
-    kill_port 8088
-    kill_port 3000
     echo "Services stopped."
     exit 0
 }

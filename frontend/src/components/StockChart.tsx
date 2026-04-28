@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import type { CandlestickData, IChartApi, Time, UTCTimestamp } from 'lightweight-charts'
 
 interface StockChartProps {
   symbol: string
@@ -9,13 +10,15 @@ interface StockChartProps {
 
 export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null)
-  const chartRef = useRef<any>(null)
+  const chartRef = useRef<IChartApi | null>(null)
   const [timeRange, setTimeRange] = useState<'1D' | '1W' | '1M' | '3M' | '1Y' | 'ALL'>('1M')
   const [interval, setInterval] = useState<'1m' | '5m' | '15m' | '1h' | '4h' | '1d'>('1h')
   const [showIntervalDropdown, setShowIntervalDropdown] = useState(false)
+  const [latestCandle, setLatestCandle] = useState<CandlestickData<Time> | null>(null)
 
   useEffect(() => {
     let isSubscribed = true
+    let removeResizeListener: (() => void) | undefined
     
     const initChart = async () => {
       if (!chartContainerRef.current || !isSubscribed) return
@@ -86,9 +89,10 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
         })
 
         // Generate candlestick data based on interval and timeRange
-        const data = []
+        const data: CandlestickData<Time>[] = []
         const now = new Date()
-        let currentPrice = 100 + Math.random() * 50
+        const symbolSeed = symbol.split('').reduce((sum, char) => sum + char.charCodeAt(0), 0)
+        let currentPrice = 100 + (symbolSeed % 75)
         
         // Calculate total milliseconds for time range
         let totalMs = 0
@@ -119,9 +123,9 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
           const timestamp = now.getTime() - (numCandles - i - 1) * intervalMs
           
           // Use timestamp for intraday, date string for daily
-          const time = interval === '1d' 
+          const time: Time = interval === '1d' 
             ? new Date(timestamp).toISOString().split('T')[0]
-            : Math.floor(timestamp / 1000)
+            : Math.floor(timestamp / 1000) as UTCTimestamp
           
           // Generate realistic price movement
           const volatility = interval === '1m' ? 0.001 : 
@@ -130,7 +134,9 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
                            interval === '1h' ? 0.005 : 
                            interval === '4h' ? 0.01 : 0.02
           
-          const change = (Math.random() - 0.5) * currentPrice * volatility * 2
+          const deterministicNoise = Math.sin((symbolSeed + i) * 12.9898) * 43758.5453
+          const normalizedNoise = deterministicNoise - Math.floor(deterministicNoise)
+          const change = (normalizedNoise - 0.5) * currentPrice * volatility * 2
           const newPrice = currentPrice + change
           
           const open = currentPrice
@@ -150,6 +156,7 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
         }
         
         candlestickSeries.setData(data)
+        setLatestCandle(data[data.length - 1] || null)
         newChart.timeScale().fitContent()
 
         // Handle resize
@@ -162,8 +169,7 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
         }
 
         window.addEventListener('resize', handleResize)
-        
-        return () => {
+        removeResizeListener = () => {
           window.removeEventListener('resize', handleResize)
         }
       } catch (error) {
@@ -175,6 +181,7 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
 
     return () => {
       isSubscribed = false
+      removeResizeListener?.()
       if (chartRef.current) {
         chartRef.current.remove()
         chartRef.current = null
@@ -188,7 +195,7 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h2 className="text-2xl font-bold text-foreground">{symbol}</h2>
-          <p className="text-sm text-muted-foreground">Stock Price Chart</p>
+          <p className="text-sm text-muted-foreground">Illustrative stock chart (demo data)</p>
         </div>
         
         <div className="flex items-center gap-2">
@@ -267,19 +274,19 @@ export function StockChart({ symbol, theme = 'light' }: StockChartProps) {
       <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
         <div>
           <span className="text-muted-foreground">Open: </span>
-          <span className="font-medium">$150.25</span>
+          <span className="font-medium">{latestCandle ? `$${latestCandle.open.toFixed(2)}` : '-'}</span>
         </div>
         <div>
           <span className="text-muted-foreground">High: </span>
-          <span className="font-medium">$152.30</span>
+          <span className="font-medium">{latestCandle ? `$${latestCandle.high.toFixed(2)}` : '-'}</span>
         </div>
         <div>
           <span className="text-muted-foreground">Low: </span>
-          <span className="font-medium">$149.10</span>
+          <span className="font-medium">{latestCandle ? `$${latestCandle.low.toFixed(2)}` : '-'}</span>
         </div>
         <div>
-          <span className="text-muted-foreground">Volume: </span>
-          <span className="font-medium">45.2M</span>
+          <span className="text-muted-foreground">Close: </span>
+          <span className="font-medium">{latestCandle ? `$${latestCandle.close.toFixed(2)}` : '-'}</span>
         </div>
       </div>
     </div>

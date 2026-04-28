@@ -227,7 +227,7 @@
 }
 
 /* Sources section */
-.markdown-body p:has(strong:contains("Sources")) {
+.markdown-body p:has(> strong:only-child) {
   @apply font-semibold text-sm mt-4 mb-2;
 }
 
