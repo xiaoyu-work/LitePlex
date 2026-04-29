@@ -5,6 +5,7 @@ A high-performance, Perplexity-style search assistant built with LangGraph and N
 ## Features
 
 - Real-time web search with Google Serper API
+- Research agent flow with query planning, source-page reading, and evidence extraction
 - Streaming responses
 - Multiple LLM providers support (OpenAI, Anthropic, Google, DeepSeek, Qwen, local vLLM)
 - Modern Next.js frontend
@@ -136,6 +137,14 @@ MODEL_NAME=./Jan-v1-4B
 BACKEND_PORT=8088
 BACKEND_HOST=0.0.0.0
 
+# Source reader controls (optional)
+SOURCE_READER_MAX_SOURCES=5
+SOURCE_READER_MAX_CHARS=400000
+SOURCE_READER_TIMEOUT_SECONDS=6
+SOURCE_READER_FALLBACK_SOURCES=3
+SOURCE_READER_CACHE_TTL_SECONDS=1800
+SEARCH_CACHE_TTL_SECONDS=300
+
 # Frontend Backend URL (optional, for deployment)
 # Server-side URL used by the Next.js API route
 # BACKEND_URL=http://localhost:8088
@@ -144,6 +153,8 @@ BACKEND_HOST=0.0.0.0
 # FRONTEND_ORIGINS=http://localhost:3000
 ```
 
+Research acceleration uses short in-memory TTL caches for Serper results and fetched source-page text. Set `SEARCH_CACHE_TTL_SECONDS=0` or `SOURCE_READER_CACHE_TTL_SECONDS=0` to disable either cache; source evidence is still scored fresh for each question. `SOURCE_READER_FALLBACK_SOURCES` lets the reader try extra unique URLs when some pages are slow, unsupported, or low-signal.
+
 ## Quality checks
 
 ```bash
@@ -151,7 +162,7 @@ uv run --python 3.10 python -m py_compile web_app.py liteplex.py
 
 cd frontend
 npm ci
-npm audit --omit=dev --audit-level=low
+npm audit --audit-level=low
 npm run lint
 npm run type-check
 npm run build

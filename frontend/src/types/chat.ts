@@ -5,11 +5,11 @@ export interface Message {
   timestamp: Date
   isStreaming?: boolean
   thinking?: string
-  status?: 'searching' | 'summarizing'
+  status?: 'planning' | 'searching' | 'reading' | 'summarizing'
 }
 
 export interface StreamResponse {
-  type: 'status' | 'thinking' | 'content' | 'done'
-  status?: 'searching' | 'summarizing'
+  type: 'status' | 'thinking' | 'step' | 'content' | 'done'
+  status?: 'planning' | 'searching' | 'reading' | 'summarizing'
   content?: string
 }

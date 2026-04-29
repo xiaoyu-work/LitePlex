@@ -96,6 +96,11 @@ export async function POST(req: NextRequest) {
                       type: 'status',
                       status: data.status
                     })}\n\n`))
+                  } else if (data.type === 'step') {
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'step',
+                      step: data.step
+                    })}\n\n`))
                   } else if (data.type === 'thinking') {
                     // Send thinking content
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({

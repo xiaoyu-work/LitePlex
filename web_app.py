@@ -131,6 +131,15 @@ def chat():
                         yield f"data: {json.dumps({'type': 'status', 'status': status})}\n\n"
                         continue
 
+                    if chunk.startswith("STEP:"):
+                        step_json = chunk[5:]
+                        try:
+                            step_data = json.loads(step_json)
+                            yield f"data: {json.dumps({'type': 'step', 'step': step_data})}\n\n"
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse step event: {e}")
+                        continue
+
                     # Check for thinking content
                     if chunk.startswith("THINKING:"):
                         thinking_content = chunk.replace("THINKING:", "")

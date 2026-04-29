@@ -34,7 +34,7 @@ jobs:
 
       - name: Audit frontend dependencies
         working-directory: frontend
-        run: npm audit --omit=dev --audit-level=low
+        run: npm audit --audit-level=low
 
       - name: Lint frontend
         working-directory: frontend

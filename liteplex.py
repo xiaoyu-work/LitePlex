@@ -6,11 +6,16 @@ Using proper LangChain tool calling pattern
 
 import json
 import contextvars
+import re
 import time
 import os
+import copy
+import threading
+from collections import OrderedDict
 from typing import Any, TypedDict, Sequence, Literal, List, Dict, Optional
 from typing_extensions import Annotated
 import httpx
+from html.parser import HTMLParser
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
@@ -20,7 +25,7 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import logging
 from dotenv import load_dotenv
 
@@ -59,9 +64,119 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 
+
+def read_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return min(max(value, minimum), maximum)
+
+
+SOURCE_READER_MAX_SOURCES = read_int_env("SOURCE_READER_MAX_SOURCES", 5, 0, 10)
+SOURCE_READER_MAX_CHARS = read_int_env("SOURCE_READER_MAX_CHARS", 400000, 50000, 1000000)
+SOURCE_READER_TIMEOUT_SECONDS = read_int_env("SOURCE_READER_TIMEOUT_SECONDS", 6, 2, 30)
+SOURCE_READER_FALLBACK_SOURCES = read_int_env("SOURCE_READER_FALLBACK_SOURCES", 3, 0, 10)
+SEARCH_CACHE_TTL_SECONDS = read_int_env("SEARCH_CACHE_TTL_SECONDS", 300, 0, 86400)
+SOURCE_READER_CACHE_TTL_SECONDS = read_int_env("SOURCE_READER_CACHE_TTL_SECONDS", 1800, 0, 604800)
+
 # Warn early but allow the app to start so health/config endpoints still work.
 if not SERPER_API_KEY:
     logger.warning("SERPER_API_KEY not found. Web search requests will fail until it is configured.")
+
+
+TRACKING_QUERY_PARAMS = {
+    "fbclid", "gclid", "gbraid", "igshid", "mc_cid", "mc_eid", "msclkid",
+    "oly_anon_id", "oly_enc_id", "ref", "s_kwcid", "spm", "vero_id", "yclid"
+}
+
+
+class TTLCache:
+    """Small thread-safe TTL cache for repeat research requests."""
+
+    def __init__(self, max_items: int, ttl_seconds: int):
+        self.max_items = max_items
+        self.ttl_seconds = ttl_seconds
+        self._items: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        if self.ttl_seconds <= 0 or self.max_items <= 0:
+            return None
+
+        now = time.monotonic()
+        with self._lock:
+            cached = self._items.get(key)
+            if not cached:
+                return None
+
+            expires_at, value = cached
+            if expires_at <= now:
+                self._items.pop(key, None)
+                return None
+
+            self._items.move_to_end(key)
+            return copy.deepcopy(value)
+
+    def set(self, key: str, value: Any) -> None:
+        if self.ttl_seconds <= 0 or self.max_items <= 0:
+            return
+
+        with self._lock:
+            self._items[key] = (time.monotonic() + self.ttl_seconds, copy.deepcopy(value))
+            self._items.move_to_end(key)
+            while len(self._items) > self.max_items:
+                self._items.popitem(last=False)
+
+
+SEARCH_RESULT_CACHE = TTLCache(max_items=256, ttl_seconds=SEARCH_CACHE_TTL_SECONDS)
+SOURCE_PAGE_CACHE = TTLCache(max_items=128, ttl_seconds=SOURCE_READER_CACHE_TTL_SECONDS)
+
+
+def is_tracking_query_param(name: str) -> bool:
+    normalized = name.lower()
+    return normalized.startswith("utm_") or normalized in TRACKING_QUERY_PARAMS
+
+
+def normalize_url(url: str) -> str:
+    """Normalize URLs for cache keys and duplicate detection without changing fetched content."""
+    if not isinstance(url, str):
+        return ""
+
+    url = url.strip()
+    if not url:
+        return ""
+
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc:
+        return url
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return ""
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    netloc = hostname if port is None or default_port else f"{hostname}:{port}"
+    path = re.sub(r"/{2,}", "/", parsed.path or "")
+    path = "" if path == "/" else path.rstrip("/")
+    query_params = [
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not is_tracking_query_param(name)
+    ]
+    query = urlencode(sorted(query_params), doseq=True)
+
+    return urlunparse((scheme, netloc, path, parsed.params, query, ""))
 
 
 def sanitize_llm_config(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -100,6 +215,54 @@ def sanitize_search_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def get_current_search_config() -> Dict[str, Any]:
     return dict(CURRENT_SEARCH_CONFIG.get())
+
+
+def step_event(step_id: str, label: str, status: str, detail: Optional[str] = None) -> str:
+    payload = {"id": step_id, "label": label, "status": status}
+    if detail:
+        payload["detail"] = detail
+    return f"STEP:{json.dumps(payload)}"
+
+
+def describe_tool_calls(messages: Sequence[BaseMessage]) -> Optional[str]:
+    for msg in reversed(messages):
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            continue
+
+        query_count = 0
+        previews: List[str] = []
+        for tool_call in tool_calls:
+            args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
+            queries = args.get("queries", []) if isinstance(args, dict) else []
+            if isinstance(queries, list):
+                query_count += len(queries)
+                previews.extend(str(query) for query in queries[:3])
+
+        if query_count:
+            preview_text = "; ".join(previews[:3])
+            return f"{query_count} planned queries: {preview_text}"
+        return f"{len(tool_calls)} tool call(s) planned"
+
+    return None
+
+
+def parse_direct_answer(content: Any) -> Dict[str, Any]:
+    if not isinstance(content, str):
+        return {"answer": str(content or ""), "sources": []}
+
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return {"answer": content, "sources": []}
+
+    if isinstance(parsed, dict):
+        return {
+            "answer": str(parsed.get("answer", "")),
+            "sources": parsed.get("sources", []) if isinstance(parsed.get("sources", []), list) else []
+        }
+
+    return {"answer": content, "sources": []}
 
 def set_llm_config(config):
     """Set request-local LLM configuration and ignore browser-supplied API keys."""
@@ -141,17 +304,25 @@ def get_llm_provider_config():
 # Helper function to extract domain from URL
 def extract_domain(url: str) -> str:
     """Extract domain from URL for deduplication"""
+    normalized = normalize_url(url)
     try:
-        parsed = urlparse(url)
-        return parsed.netloc.lower()
+        parsed = urlparse(normalized)
+        domain = parsed.netloc.lower()
+        return domain[4:] if domain.startswith("www.") else domain
     except (ValueError, AttributeError):
-        return url.lower()
+        return normalized.lower()
 
 # Helper function to search single query
 def search_single_query(query: str, num_results: int = 10) -> Dict:
     """Execute a single search query"""
     if not SERPER_API_KEY:
         raise RuntimeError("SERPER_API_KEY is not configured")
+
+    cache_key = f"{num_results}:{query.strip().casefold()}"
+    cached = SEARCH_RESULT_CACHE.get(cache_key)
+    if cached:
+        logger.info(f"♻️  [SEARCH CACHE] Reusing Serper results for '{query}'")
+        return cached
 
     response = httpx.post(
         "https://google.serper.dev/search",
@@ -165,25 +336,310 @@ def search_single_query(query: str, num_results: int = 10) -> Dict:
     response.raise_for_status()
     result = response.json()
 
-    return {
+    search_result = {
         'query': query,
         'results': result.get('organic', []),
         'answerBox': result.get('answerBox', None)
     }
+    SEARCH_RESULT_CACHE.set(cache_key, search_result)
+    return search_result
 
-# Helper function to deduplicate results by domain
-def deduplicate_by_domain(all_results: List[Dict]) -> List[Dict]:
-    """Deduplicate results keeping only the first/best result per domain"""
-    seen_domains = set()
+
+def deduplicate_results(all_results: List[Dict], max_per_domain: int = 2) -> List[Dict]:
+    """Deduplicate exact URLs while preserving limited same-domain coverage for accuracy."""
+    seen_urls = set()
+    domain_counts: Dict[str, int] = {}
     deduplicated = []
-    
+
     for result in all_results:
-        domain = extract_domain(result.get('link', ''))
-        if domain and domain not in seen_domains:
-            seen_domains.add(domain)
-            deduplicated.append(result)
-    
+        link = result.get('link', '')
+        normalized_url = normalize_url(link)
+        parsed_url = urlparse(normalized_url)
+        if (
+            not normalized_url
+            or parsed_url.scheme not in {"http", "https"}
+            or normalized_url in seen_urls
+        ):
+            continue
+
+        domain = extract_domain(normalized_url)
+        if domain_counts.get(domain, 0) >= max_per_domain:
+            continue
+
+        seen_urls.add(normalized_url)
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        deduplicated.append({**result, 'normalizedLink': normalized_url})
+
     return deduplicated
+
+
+class ReadableHTMLParser(HTMLParser):
+    """Small dependency-free text extractor for source pages."""
+
+    BLOCK_TAGS = {
+        "article", "section", "p", "div", "br", "li", "tr", "td", "th",
+        "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"
+    }
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "canvas", "iframe"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self.skip_depth = 0
+        self.canonical_url: Optional[str] = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        attrs_dict = {
+            name.lower(): value
+            for name, value in attrs
+            if isinstance(name, str) and isinstance(value, str)
+        }
+
+        if tag == "link":
+            rel = attrs_dict.get("rel", "").lower().split()
+            href = attrs_dict.get("href")
+            if "canonical" in rel and href:
+                self.canonical_url = href
+
+        if tag in self.SKIP_TAGS:
+            self.skip_depth += 1
+            return
+        if self.skip_depth == 0 and tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS and self.skip_depth:
+            self.skip_depth -= 1
+            return
+        if self.skip_depth == 0 and tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth == 0 and data.strip():
+            self.parts.append(data.strip())
+
+    def get_text(self) -> str:
+        text = " ".join(self.parts)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n\n", text)
+        return text.strip()
+
+
+STOP_WORDS = {
+    "about", "after", "again", "also", "and", "are", "because", "been",
+    "being", "can", "could", "did", "does", "for", "from", "had", "has",
+    "have", "how", "into", "its", "latest", "more", "news", "not", "now",
+    "price", "recent", "should", "than", "that", "the", "their", "then",
+    "there", "these", "this", "today", "was", "were", "what", "when",
+    "where", "which", "while", "who", "why", "with", "would", "you", "your"
+}
+
+
+def extract_terms(queries: List[str]) -> List[str]:
+    terms = []
+    for query in queries:
+        for term in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9._-]+", query.lower()):
+            if len(term) > 2 and term not in STOP_WORDS:
+                terms.append(term)
+    return sorted(set(terms))
+
+
+def extract_readable_document(html: str, base_url: str) -> tuple[str, Optional[str]]:
+    parser = ReadableHTMLParser()
+    parser.feed(html)
+    canonical_url = None
+    if parser.canonical_url:
+        canonical_url = normalize_url(urljoin(base_url, parser.canonical_url))
+    return parser.get_text(), canonical_url
+
+
+def extract_readable_text(html: str) -> str:
+    text, _ = extract_readable_document(html, "")
+    return text
+
+
+def chunk_text(text: str, max_chars: int = 900) -> List[str]:
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}|(?<=[.!?])\s+(?=[A-Z0-9])", text) if p.strip()]
+    chunks: List[str] = []
+    current = ""
+
+    for paragraph in paragraphs:
+        if len(paragraph) > max_chars:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            for start in range(0, len(paragraph), max_chars):
+                chunks.append(paragraph[start:start + max_chars].strip())
+            continue
+
+        if len(current) + len(paragraph) + 1 > max_chars:
+            if current:
+                chunks.append(current.strip())
+            current = paragraph
+        else:
+            current = f"{current} {paragraph}".strip()
+
+    if current:
+        chunks.append(current.strip())
+
+    return chunks
+
+
+def score_passage(passage: str, terms: List[str]) -> int:
+    passage_lower = passage.lower()
+    score = 0
+    for term in terms:
+        occurrences = passage_lower.count(term)
+        if occurrences:
+            score += occurrences * (3 if len(term) > 4 else 1)
+    return score
+
+
+def fetch_source_page(url: str) -> Optional[Dict[str, Any]]:
+    """Fetch and cache readable source-page text."""
+    normalized_url = normalize_url(url)
+    if not normalized_url:
+        return None
+
+    parsed_url = urlparse(normalized_url)
+    if parsed_url.scheme not in {"http", "https"}:
+        return None
+
+    cached = SOURCE_PAGE_CACHE.get(normalized_url)
+    if cached:
+        logger.info(f"♻️  [SOURCE CACHE] Reusing source page {normalized_url}")
+        return cached
+
+    try:
+        response = httpx.get(
+            url,
+            follow_redirects=True,
+            timeout=httpx.Timeout(SOURCE_READER_TIMEOUT_SECONDS, connect=2.0),
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; LitePlexBot/1.0; "
+                    "+https://github.com/xiaoyu-work/LitePlex)"
+                )
+            }
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        logger.info(f"Source fetch skipped for {url}: {exc}")
+        return None
+
+    final_url = normalize_url(str(response.url)) or normalized_url
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type and not any(kind in content_type for kind in ("text/html", "text/plain", "application/xhtml")):
+        logger.info(f"Source fetch skipped for {url}: unsupported content type {content_type}")
+        return None
+
+    raw_text = response.text[:SOURCE_READER_MAX_CHARS]
+    readable_text, canonical_url = extract_readable_document(raw_text, str(response.url))
+    if len(readable_text) < 200:
+        return None
+
+    page = {
+        "url": canonical_url or final_url,
+        "readable_text": readable_text
+    }
+    SOURCE_PAGE_CACHE.set(normalized_url, page)
+    if final_url != normalized_url:
+        SOURCE_PAGE_CACHE.set(final_url, page)
+    if canonical_url and canonical_url not in {normalized_url, final_url}:
+        SOURCE_PAGE_CACHE.set(canonical_url, page)
+
+    return page
+
+
+def fetch_source_evidence(source: Dict, queries: List[str]) -> Optional[Dict]:
+    """Return the most relevant evidence excerpts from one source page."""
+    url = source.get('url')
+    if not url:
+        return None
+
+    page = fetch_source_page(url)
+    if not page:
+        return None
+
+    terms = extract_terms(queries)
+    passages = chunk_text(page["readable_text"])
+    ranked = sorted(
+        ((score_passage(passage, terms), index, passage) for index, passage in enumerate(passages)),
+        key=lambda item: (-item[0], item[1])
+    )
+
+    excerpts = [passage for score, _, passage in ranked if score > 0][:2]
+    if not excerpts:
+        excerpts = [passage for _, _, passage in ranked[:1]]
+
+    if not excerpts:
+        return None
+
+    return {
+        "index": source["index"],
+        "title": source["title"],
+        "url": page["url"],
+        "excerpts": excerpts,
+        "bestScore": ranked[0][0] if ranked else 0
+    }
+
+
+def select_source_candidates(sources: List[Dict], max_sources: int) -> List[Dict]:
+    """Select unique source URLs, keeping fallbacks for failed or low-signal pages."""
+    candidate_limit = min(len(sources), max_sources + SOURCE_READER_FALLBACK_SOURCES)
+    candidates: List[Dict] = []
+    seen_urls = set()
+
+    for source in sources:
+        normalized_url = normalize_url(source.get('url', ''))
+        parsed_url = urlparse(normalized_url)
+        if parsed_url.scheme not in {"http", "https"} or normalized_url in seen_urls:
+            continue
+
+        seen_urls.add(normalized_url)
+        candidates.append({**source, "normalizedUrl": normalized_url})
+        if len(candidates) >= candidate_limit:
+            break
+
+    return candidates
+
+
+def collect_source_evidence(sources: List[Dict], queries: List[str]) -> List[Dict]:
+    """Read top search results in parallel and extract relevant evidence passages."""
+    max_sources = min(SOURCE_READER_MAX_SOURCES, len(sources))
+    if max_sources <= 0:
+        return []
+
+    evidence: List[Dict] = []
+    candidates = select_source_candidates(sources, max_sources)
+    if not candidates:
+        return []
+
+    start = time.time()
+
+    with ThreadPoolExecutor(max_workers=min(6, len(candidates))) as executor:
+        future_to_source = {
+            executor.submit(fetch_source_evidence, source, queries): source
+            for source in candidates
+        }
+        for future in as_completed(future_to_source):
+            try:
+                item = future.result(timeout=8)
+                if item:
+                    evidence.append(item)
+            except Exception as exc:
+                source = future_to_source[future]
+                logger.info(f"Evidence extraction failed for {source.get('url')}: {exc}")
+
+    evidence.sort(key=lambda item: (-item.get("bestScore", 0), item["index"]))
+    selected_evidence = evidence[:max_sources]
+    logger.info(
+        f"📖 [SOURCE READER] Extracted evidence from {len(selected_evidence)}/"
+        f"{max_sources} sources using {len(candidates)} candidate pages in {time.time() - start:.2f}s"
+    )
+    return selected_evidence
 
 # Import for tool schema
 from pydantic import BaseModel, Field, field_validator
@@ -191,7 +647,7 @@ from pydantic import BaseModel, Field, field_validator
 class GoogleSearchInput(BaseModel):
     """Input schema for google_search tool"""
     queries: List[str] = Field(
-        description="List of search queries for comprehensive coverage"
+        description="List of search queries for comprehensive coverage; the tool also reads top source pages for evidence"
     )
     
     @field_validator('queries')
@@ -215,7 +671,7 @@ class GoogleSearchInput(BaseModel):
 @tool(args_schema=GoogleSearchInput)
 def google_search(queries: List[str]) -> str:
     """
-    Search Google with multiple queries for comprehensive results.
+    Search Google with multiple queries, read top source pages, and extract evidence passages.
     Number of queries is configurable (1-6) for optimal balance of speed and coverage.
     
     Args:
@@ -248,27 +704,35 @@ def google_search(queries: List[str]) -> str:
         # Parallel execution for maximum speed
         all_results = []
         all_answer_boxes = []
+        results_by_query: Dict[int, List[Dict]] = {}
+        answer_boxes_by_query: Dict[int, Any] = {}
         errors = []
         
         with ThreadPoolExecutor(max_workers=6) as executor:
             # Submit all queries at once
             future_to_query = {
-                executor.submit(search_single_query, query, 10): query 
-                for query in queries
+                executor.submit(search_single_query, query, 10): (index, query)
+                for index, query in enumerate(queries)
             }
             
             # Collect results as they complete
             for future in as_completed(future_to_query):
-                query = future_to_query[future]
+                query_index, query = future_to_query[future]
                 try:
                     result = future.result(timeout=3)  # 3 second timeout per query
-                    all_results.extend(result['results'])
+                    results_by_query[query_index] = result['results']
                     if result['answerBox']:
-                        all_answer_boxes.append(result['answerBox'])
+                        answer_boxes_by_query[query_index] = result['answerBox']
                     logger.info(f"✅ Query completed: '{query}' - {len(result['results'])} results")
                 except Exception as e:
                     logger.error(f"❌ Query failed: '{query}' - {e}")
                     errors.append(str(e))
+
+        for query_index in range(len(queries)):
+            all_results.extend(results_by_query.get(query_index, []))
+            answer_box = answer_boxes_by_query.get(query_index)
+            if answer_box:
+                all_answer_boxes.append(answer_box)
         
         parallel_time = time.time() - start_time
         logger.info(f"⏱️  [PARALLEL SEARCH] All queries completed in: {parallel_time:.2f}s")
@@ -276,9 +740,9 @@ def google_search(queries: List[str]) -> str:
         if not all_results and not all_answer_boxes and errors:
             return json.dumps({'text': f"Search failed: {errors[0]}", 'sources': []})
         
-        # Deduplicate by domain
+        # Deduplicate exact URLs and limit per-domain repeats while preserving coverage.
         dedup_start = time.time()
-        unique_results = deduplicate_by_domain(all_results)
+        unique_results = deduplicate_results(all_results)
         dedup_time = time.time() - dedup_start
         logger.info(f"⏱️  [DEDUPLICATION] {len(all_results)} → {len(unique_results)} results in {dedup_time:.2f}s")
         
@@ -310,8 +774,26 @@ def google_search(queries: List[str]) -> str:
             sources_data.append({
                 'index': i,
                 'title': title,
-                'url': link
+                'url': link,
+                'normalizedUrl': item.get('normalizedLink') or normalize_url(link)
             })
+
+        evidence_data = collect_source_evidence(sources_data, queries)
+        evidence_urls_by_index = {evidence["index"]: evidence["url"] for evidence in evidence_data}
+        for source in sources_data:
+            if source["index"] in evidence_urls_by_index:
+                source["url"] = evidence_urls_by_index[source["index"]]
+
+        if evidence_data:
+            formatted += "\n\nEvidence Extracted from Source Pages (ordered by relevance):\n"
+            for evidence in evidence_data:
+                formatted += f"\n[{evidence['index']}] {evidence['title']}\n"
+                for excerpt_index, excerpt in enumerate(evidence["excerpts"], 1):
+                    formatted += f"    Evidence {excerpt_index}: {excerpt}\n"
+                formatted += f"    URL: {evidence['url']}\n"
+        else:
+            formatted += "\n\nEvidence Extracted from Source Pages:\n"
+            formatted += "    Source reader could not extract page text; use search snippets cautiously.\n"
         
         format_time = time.time() - format_start
         logger.info(f"⏱️  [FORMAT] Formatting took: {format_time:.2f}s")
@@ -321,7 +803,8 @@ def google_search(queries: List[str]) -> str:
         
         return json.dumps({
             'text': formatted,
-            'sources': sources_data
+            'sources': sources_data,
+            'evidence': evidence_data
         })
         
     except Exception as e:
@@ -446,11 +929,11 @@ def agent_node(state: AgentState) -> dict:
     logger.info(f"⏱️  [AGENT SETUP] LLM setup took: {setup_time:.2f}s")
     
     # Simple system message - just decide whether to use tools
-    system_message = SystemMessage(content="""You are a helpful assistant with access to web search.
+    system_message = SystemMessage(content="""You are a helpful research assistant with access to web search and source reading.
 
 DECISION FLOW:
-1. For stock ticker queries → Respond directly with stock chart widget (no tools)
-2. For greetings, simple chat, or meta questions → Respond directly with JSON (no tools)
+1. For greetings, simple chat, or meta questions → Respond directly with JSON (no tools)
+2. For stock/company/current-information queries → Use google_search tool
 3. For factual questions or information requests → Use google_search tool
 4. When unsure → Use google_search tool
 
@@ -473,12 +956,11 @@ WHEN TO USE TOOLS:
 Use google_search for:
    - How-to questions (how to make, how to do, how to...)
    - Recipe or cooking questions
-   - Factual questions, current events, or real-world information (except direct stock ticker queries)
+   - Factual questions, current events, or real-world information
    - Questions needing specific data or up-to-date information
    - General stock market questions (not specific tickers)
 
 WHEN NOT TO USE TOOLS (respond directly with JSON):
-   - Specific stock ticker queries (AAPL, TSLA, etc.)
    - Greetings (hi, hello, hey, good morning, etc.)
    - Thank you messages
    - Simple acknowledgments
@@ -486,7 +968,8 @@ WHEN NOT TO USE TOOLS (respond directly with JSON):
    - Meta questions about yourself or this system
 
 IMPORTANT:
-The google_search tool requires a LIST of queries, not a single string!
+The google_search tool requires a LIST of queries, not a single string.
+It searches the web, reads top source pages, and returns extracted evidence passages for grounded citations.
 
 MULTI-QUERY SEARCH REQUIREMENTS:
 Provide queries as a list to google_search tool (system will adjust to configured count).
@@ -786,6 +1269,8 @@ CRITICAL CITATION RULES:
 ⚠️ NEVER group citations at the end of paragraphs
 ⚠️ Each distinct fact needs its own citation
 ⚠️ DO NOT include source URLs or links in the main answer text - only use <sup> numbers
+⚠️ Prefer "Evidence Extracted from Source Pages" over search snippets
+⚠️ Only cite sources whose evidence or snippet directly supports the sentence
 
 FORMATTING RULES:
 ⚠️ Output valid GitHub-Flavored Markdown in the "answer" field
@@ -1032,6 +1517,9 @@ CITATION RULES:
 - Use <sup>1</sup>, <sup>2</sup>, etc. to cite sources
 - Number citations sequentially starting from 1
 - Place citations immediately after the relevant information
+- Prefer "Evidence Extracted from Source Pages" over search snippets.
+- Only cite a source when the provided evidence or snippet directly supports the sentence.
+- If evidence is missing or conflicting, say so instead of overstating certainty.
 
 ANSWER STYLE:
 - Use ## for section headers
@@ -1263,31 +1751,24 @@ class PerplexityAssistant:
         logger.info(f"👤 USER: {user_input}")
         logger.info(f"⏱️  [STREAM START] Starting request processing")
         logger.info(f"{'='*60}")
-        
-        # Check if this looks like a question that needs search
-        # Simple heuristic: questions about facts, current events, etc.
-        needs_search = any(word in user_input.lower() for word in [
-            'what', 'when', 'where', 'who', 'how', 'why', 'price', 'cost', 
-            'latest', 'current', 'today', 'news', 'stock', '?'
-        ])
-        
-        if needs_search:
-            # Send searching status immediately
-            yield "STATUS:SEARCHING"
-            # Small delay to let the animation show
-            time.sleep(0.5)
-            
-            # Check if cancelled
-            if stop_event and stop_event.is_set():
-                logger.info("Request cancelled during search")
-                return
-        
+
+        yield "STATUS:PLANNING"
+        yield step_event(
+            "planning",
+            "Planning research",
+            "active",
+            "Deciding whether to search and which angles to cover."
+        )
+
         # Use streaming directly from the graph
         try:
             full_content = ""
             used_tools = False
             all_messages = list(messages_to_include)  # Track all messages
             sources_data = []
+            direct_content = ""
+            direct_sources = []
+            planning_finalized = False
 
             # Stream through the graph
             graph_start = time.time()
@@ -1303,6 +1784,9 @@ class PerplexityAssistant:
 
                     if node_name == "tools":
                         used_tools = True
+                        yield step_event("searching", "Searching the web", "done")
+                        yield step_event("reading", "Reading source pages", "done")
+                        yield step_event("summarizing", "Composing grounded answer", "active")
                         yield "STATUS:SUMMARIZING"
                         # Collect messages from tools
                         if "messages" in node_data:
@@ -1310,7 +1794,24 @@ class PerplexityAssistant:
 
                     elif node_name == "agent":
                         if "messages" in node_data:
-                            all_messages.extend(node_data["messages"])
+                            agent_messages = node_data["messages"]
+                            all_messages.extend(agent_messages)
+                            tool_plan = describe_tool_calls(agent_messages)
+                            if tool_plan:
+                                planning_finalized = True
+                                yield step_event("planning", "Planning research", "done", tool_plan)
+                                yield step_event("searching", "Searching the web", "active", tool_plan)
+                                yield step_event("reading", "Reading source pages", "active", "Fetching top results and extracting evidence.")
+                                yield "STATUS:READING"
+                            else:
+                                for message in agent_messages:
+                                    if isinstance(message, AIMessage):
+                                        parsed_direct = parse_direct_answer(message.content)
+                                        direct_content = parsed_direct["answer"]
+                                        direct_sources = parsed_direct["sources"]
+                                if not planning_finalized:
+                                    planning_finalized = True
+                                    yield step_event("planning", "Planning research", "done", "No web search needed.")
 
             graph_time = time.time() - graph_start
             logger.info(f"⏱️  [GRAPH COMPLETE] Graph took: {graph_time:.2f}s")
@@ -1337,10 +1838,22 @@ class PerplexityAssistant:
 
                     elif result_type == "done":
                         logger.info(f"📝 [STREAMING SUMMARIZE] Done, {len(content)} chars")
+                        yield step_event("summarizing", "Composing grounded answer", "done")
 
                     elif result_type == "error":
                         logger.error(f"❌ [STREAMING SUMMARIZE] Error: {content}")
+                        yield step_event("summarizing", "Composing grounded answer", "error", str(content))
                         yield f"Error: {content}"
+
+            elif direct_content:
+                yield "STATUS:SUMMARIZING"
+                yield step_event("summarizing", "Composing response", "active")
+                yield f"STREAM:{direct_content}"
+                full_content = direct_content
+                if direct_sources:
+                    sources_data = direct_sources
+                    yield f"SOURCES:{json.dumps(direct_sources)}"
+                yield step_event("summarizing", "Composing response", "done")
 
             # Store in history
             if full_content and not use_request_history:

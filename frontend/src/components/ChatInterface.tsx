@@ -18,16 +18,26 @@ interface Source {
   url: string
 }
 
+type ResearchStepStatus = 'active' | 'done' | 'error'
+
+interface ResearchStep {
+  id: string
+  label: string
+  status: ResearchStepStatus
+  detail?: string
+}
+
 interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
   thinking?: string
   sources?: Source[]
+  steps?: ResearchStep[]
   timestamp: Date
 }
 
-type WorkflowStatus = 'thinking' | 'searching' | 'summarizing' | null
+type WorkflowStatus = 'thinking' | 'planning' | 'searching' | 'reading' | 'summarizing' | null
 
 function createId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -48,6 +58,30 @@ function readStoredLLMConfig() {
   } catch (error) {
     console.error('Failed to parse saved LLM config:', error)
     return null
+  }
+}
+
+function normalizeStep(input: unknown): ResearchStep | null {
+  if (!input || typeof input !== 'object') {
+    return null
+  }
+
+  const step = input as Partial<ResearchStep>
+  const validStatuses: ResearchStepStatus[] = ['active', 'done', 'error']
+
+  if (
+    typeof step.id !== 'string' ||
+    typeof step.label !== 'string' ||
+    !validStatuses.includes(step.status as ResearchStepStatus)
+  ) {
+    return null
+  }
+
+  return {
+    id: step.id,
+    label: step.label,
+    status: step.status as ResearchStepStatus,
+    detail: typeof step.detail === 'string' ? step.detail : undefined
   }
 }
 
@@ -206,10 +240,34 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
                   ...message,
                   thinking: (message.thinking || '') + (parsed.content || '')
                 }))
+              } else if (parsed.type === 'step') {
+                const step = normalizeStep(parsed.step)
+                if (step) {
+                  updateLastAssistantMessage(message => {
+                    const steps = message.steps || []
+                    const existingIndex = steps.findIndex(existingStep => existingStep.id === step.id)
+
+                    if (existingIndex >= 0) {
+                      return {
+                        ...message,
+                        steps: steps.map((existingStep, index) => index === existingIndex ? step : existingStep)
+                      }
+                    }
+
+                    return {
+                      ...message,
+                      steps: [...steps, step]
+                    }
+                  })
+                }
               } else if (parsed.type === 'status') {
                 // Update status
-                if (parsed.status === 'searching') {
+                if (parsed.status === 'planning') {
+                  setCurrentStatus('planning')
+                } else if (parsed.status === 'searching') {
                   setCurrentStatus('searching')
+                } else if (parsed.status === 'reading') {
+                  setCurrentStatus('reading')
                 } else if (parsed.status === 'summarizing') {
                   setCurrentStatus('summarizing')
                 }
@@ -296,8 +354,16 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
         text: 'Thinking',
         icon: '',
       },
+      planning: {
+        text: 'Planning research',
+        icon: '',
+      },
       searching: {
         text: 'Searching the web',
+        icon: '',
+      },
+      reading: {
+        text: 'Reading sources',
         icon: '',
       },
       summarizing: {
@@ -318,6 +384,50 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
           <span className="loading-dot-2">.</span>
           <span className="loading-dot-3">.</span>
         </span>
+      </div>
+    )
+  }
+
+  const AgentSteps = ({ steps }: { steps?: ResearchStep[] }) => {
+    if (!steps || steps.length === 0) return null
+
+    const statusClass: Record<ResearchStepStatus, string> = {
+      active: 'border-blue-500/40 bg-blue-500/10 text-blue-600 dark:text-blue-300',
+      done: 'border-green-500/30 bg-green-500/10 text-green-600 dark:text-green-300',
+      error: 'border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-300',
+    }
+
+    const marker: Record<ResearchStepStatus, string> = {
+      active: '…',
+      done: '✓',
+      error: '!',
+    }
+
+    return (
+      <div className="mb-4 rounded-lg border border-border bg-muted/20 p-3">
+        <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">
+          Agent activity
+        </div>
+        <div className="space-y-2">
+          {steps.map((step) => (
+            <div
+              key={step.id}
+              className={`rounded-md border px-3 py-2 text-sm ${statusClass[step.status]}`}
+            >
+              <div className="flex items-center gap-2">
+                <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-background/70 text-xs">
+                  {marker[step.status]}
+                </span>
+                <span className="font-medium">{step.label}</span>
+              </div>
+              {step.detail && (
+                <div className="mt-1 pl-7 text-xs opacity-80">
+                  {step.detail}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
     )
   }
@@ -359,6 +469,8 @@ export default function ChatInterface({ chatId, initialQuery }: ChatInterfacePro
                       <StatusIndicator status={currentStatus} />
                     </div>
                   )}
+
+                  <AgentSteps steps={message.steps} />
 
                   {/* Reasoning Section (if exists) */}
                   {message.thinking && (
