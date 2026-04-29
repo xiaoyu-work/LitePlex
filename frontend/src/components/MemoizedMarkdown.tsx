@@ -45,8 +45,42 @@ function toSuperscript(value: string): string {
   return value.split('').map((char) => chars[char] ?? char).join('')
 }
 
+function expandCitationNumbers(value: string): number[] {
+  const citations = new Set<number>()
+  const parts = value.split(/[,;\s]+/).filter(Boolean)
+
+  for (const part of parts) {
+    if (part.includes('-')) {
+      const [start, end] = part.split('-', 2).map(Number)
+      if (Number.isInteger(start) && Number.isInteger(end) && start > 0 && end >= start && end <= 100) {
+        for (let citation = start; citation <= end; citation += 1) {
+          citations.add(citation)
+        }
+      }
+      continue
+    }
+
+    const citation = Number(part)
+    if (Number.isInteger(citation) && citation > 0) {
+      citations.add(citation)
+    }
+  }
+
+  return [...citations]
+}
+
 function normalizeMarkdown(content: string): string {
-  return content.replace(/<sup>([\d,\s-]+)<\/sup>/gi, (_, citation: string) => toSuperscript(citation))
+  return content.replace(/<sup>([\d,\s;-]+)<\/sup>/gi, (_, citation: string) => {
+    const citationNumbers = expandCitationNumbers(citation)
+
+    if (citationNumbers.length === 0) {
+      return toSuperscript(citation)
+    }
+
+    return citationNumbers
+      .map((citationNumber) => `[${toSuperscript(String(citationNumber))}](#source-${citationNumber})`)
+      .join('')
+  })
 }
 
 // Memoized block component
@@ -56,7 +90,19 @@ const MarkdownBlock = memo(({ block }: { block: string }) => {
       remarkPlugins={[remarkGfm, remarkBreaks]}
       components={{
         // Custom link component to open in new tab
-        a: ({node: _node, ...props}) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+        a: ({node: _node, href, className, ...props}) => {
+          if (href?.startsWith('#source-')) {
+            return (
+              <a
+                {...props}
+                href={href}
+                className={`align-super text-xs font-semibold text-blue-500 hover:text-blue-400 no-underline ml-0.5 ${className || ''}`}
+              />
+            )
+          }
+
+          return <a {...props} href={href} className={className} target="_blank" rel="noopener noreferrer" />
+        },
         // Ensure proper heading sizes
         h1: ({node: _node, ...props}) => <h1 className="text-2xl font-bold my-4" {...props} />,
         h2: ({node: _node, ...props}) => <h2 className="text-xl font-semibold my-3" {...props} />,

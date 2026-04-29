@@ -16,6 +16,23 @@ interface Source {
   index: number
   title: string
   url: string
+  evidence?: SourceEvidence[]
+  citationCheck?: CitationCheck
+}
+
+interface SourceEvidence {
+  text: string
+  score?: number
+}
+
+interface CitationCheck {
+  cited: boolean
+  confidence: 'supported' | 'partial' | 'low' | 'uncited'
+  reason: string
+  claims?: string[]
+  matchedExcerpt?: string
+  overlapTerms?: string[]
+  checkedClaim?: string
 }
 
 type ResearchStepStatus = 'active' | 'done' | 'error'

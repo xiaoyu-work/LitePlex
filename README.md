@@ -6,6 +6,7 @@ A high-performance, Perplexity-style search assistant built with LangGraph and N
 
 - Real-time web search with Google Serper API
 - Research agent flow with query planning, source-page reading, and evidence extraction
+- Evidence-level source drill-down with lightweight citation confidence checks
 - Streaming responses
 - Multiple LLM providers support (OpenAI, Anthropic, Google, DeepSeek, Qwen, local vLLM)
 - Modern Next.js frontend

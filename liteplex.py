@@ -570,18 +570,26 @@ def fetch_source_evidence(source: Dict, queries: List[str]) -> Optional[Dict]:
         key=lambda item: (-item[0], item[1])
     )
 
-    excerpts = [passage for score, _, passage in ranked if score > 0][:2]
-    if not excerpts:
-        excerpts = [passage for _, _, passage in ranked[:1]]
+    excerpt_items = [
+        {"text": passage, "score": score}
+        for score, _, passage in ranked
+        if score > 0
+    ][:2]
+    if not excerpt_items:
+        excerpt_items = [
+            {"text": passage, "score": score}
+            for score, _, passage in ranked[:1]
+        ]
 
-    if not excerpts:
+    if not excerpt_items:
         return None
 
     return {
         "index": source["index"],
         "title": source["title"],
         "url": page["url"],
-        "excerpts": excerpts,
+        "excerpts": [item["text"] for item in excerpt_items],
+        "evidence": excerpt_items,
         "bestScore": ranked[0][0] if ranked else 0
     }
 
@@ -640,6 +648,202 @@ def collect_source_evidence(sources: List[Dict], queries: List[str]) -> List[Dic
         f"{max_sources} sources using {len(candidates)} candidate pages in {time.time() - start:.2f}s"
     )
     return selected_evidence
+
+
+SUPERSCRIPT_TO_DIGIT = str.maketrans({
+    "⁰": "0",
+    "¹": "1",
+    "²": "2",
+    "³": "3",
+    "⁴": "4",
+    "⁵": "5",
+    "⁶": "6",
+    "⁷": "7",
+    "⁸": "8",
+    "⁹": "9",
+    "⁻": "-"
+})
+
+
+def parse_citation_numbers(value: str) -> List[int]:
+    normalized = value.translate(SUPERSCRIPT_TO_DIGIT)
+    numbers: List[int] = []
+
+    for part in re.split(r"[,;\s]+", normalized):
+        if not part:
+            continue
+
+        if "-" in part:
+            try:
+                start, end = [int(item) for item in part.split("-", 1)]
+            except ValueError:
+                continue
+            if 0 < start <= end <= 100:
+                numbers.extend(range(start, end + 1))
+            continue
+
+        if part.isdigit():
+            numbers.append(int(part))
+
+    return list(dict.fromkeys(numbers))
+
+
+def clean_claim_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\[[^\]]+\]\([^)]+\)", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" -:;")
+
+
+def claim_before_citation(answer: str, citation_start: int) -> str:
+    prefix = answer[max(0, citation_start - 700):citation_start]
+    sentence_start = max(prefix.rfind(". "), prefix.rfind("? "), prefix.rfind("! "), prefix.rfind("\n"))
+    claim = prefix[sentence_start + 1:] if sentence_start >= 0 else prefix
+    return clean_claim_text(claim)[-400:]
+
+
+def extract_cited_claims(answer: str) -> Dict[int, List[str]]:
+    cited_claims: Dict[int, List[str]] = {}
+    patterns = [
+        re.compile(r"<sup>\s*([\d,\s;\-]+)\s*</sup>", re.IGNORECASE),
+        re.compile(r"([⁰¹²³⁴⁵⁶⁷⁸⁹][⁰¹²³⁴⁵⁶⁷⁸⁹⁻,\s]*)")
+    ]
+
+    for pattern in patterns:
+        for match in pattern.finditer(answer):
+            raw_citation = match.group(1)
+            numbers = parse_citation_numbers(raw_citation)
+            if not numbers:
+                continue
+
+            claim = claim_before_citation(answer, match.start())
+            if not claim:
+                continue
+
+            for number in numbers:
+                cited_claims.setdefault(number, []).append(claim)
+
+    return cited_claims
+
+
+def source_evidence_items(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = evidence.get("evidence")
+    if isinstance(items, list) and items:
+        return [
+            {"text": str(item.get("text", "")), "score": int(item.get("score", 0))}
+            for item in items
+            if isinstance(item, dict) and item.get("text")
+        ]
+
+    return [
+        {"text": str(excerpt), "score": int(evidence.get("bestScore", 0))}
+        for excerpt in evidence.get("excerpts", [])
+        if excerpt
+    ]
+
+
+def apply_evidence_to_sources(sources: List[Dict], evidence_data: List[Dict]) -> List[Dict]:
+    sources_by_index = {source["index"]: source for source in sources}
+
+    for evidence in evidence_data:
+        source = sources_by_index.get(evidence.get("index"))
+        if not source:
+            continue
+
+        source["url"] = evidence.get("url") or source["url"]
+        source["evidence"] = source_evidence_items(evidence)
+        source["evidenceScore"] = int(evidence.get("bestScore", 0))
+
+    return sources
+
+
+def score_claim_against_excerpts(claim: str, excerpts: List[str]) -> Dict[str, Any]:
+    terms = extract_terms([claim])
+    if not terms:
+        return {"ratio": 0.0, "overlapTerms": [], "matchedExcerpt": ""}
+
+    unique_terms = sorted(set(terms))
+    best = {"ratio": 0.0, "overlapTerms": [], "matchedExcerpt": ""}
+
+    for excerpt in excerpts:
+        excerpt_lower = excerpt.lower()
+        overlap_terms = [term for term in unique_terms if term in excerpt_lower]
+        ratio = len(overlap_terms) / len(unique_terms)
+
+        if ratio > best["ratio"] or (
+            ratio == best["ratio"] and len(overlap_terms) > len(best["overlapTerms"])
+        ):
+            best = {
+                "ratio": ratio,
+                "overlapTerms": overlap_terms,
+                "matchedExcerpt": excerpt
+            }
+
+    return best
+
+
+def verify_source_citations(answer: str, sources: List[Dict]) -> List[Dict]:
+    """Lightweight citation check using already extracted evidence only."""
+    cited_claims = extract_cited_claims(answer)
+    verified_sources = copy.deepcopy(sources)
+
+    for source in verified_sources:
+        source_index = source.get("index")
+        claims = cited_claims.get(source_index, [])
+        evidence_items = source.get("evidence", [])
+        excerpts = [
+            str(item.get("text", ""))
+            for item in evidence_items
+            if isinstance(item, dict) and item.get("text")
+        ]
+
+        if not claims:
+            source["citationCheck"] = {
+                "cited": False,
+                "confidence": "uncited",
+                "reason": "This source was returned for context but was not cited in the final answer."
+            }
+            continue
+
+        if not excerpts:
+            source["citationCheck"] = {
+                "cited": True,
+                "confidence": "low",
+                "reason": "The answer cites this source, but no readable evidence excerpt was extracted.",
+                "claims": claims[:3]
+            }
+            continue
+
+        best_claim = ""
+        best_match: Dict[str, Any] = {"ratio": 0.0, "overlapTerms": [], "matchedExcerpt": ""}
+        for claim in claims:
+            match = score_claim_against_excerpts(claim, excerpts)
+            if match["ratio"] > best_match["ratio"]:
+                best_match = match
+                best_claim = claim
+
+        overlap_count = len(best_match["overlapTerms"])
+        if best_match["ratio"] >= 0.35 or overlap_count >= 4:
+            confidence = "supported"
+            reason = "The cited sentence overlaps with extracted source evidence."
+        elif overlap_count > 0:
+            confidence = "partial"
+            reason = "The cited sentence has partial overlap with extracted source evidence."
+        else:
+            confidence = "low"
+            reason = "The cited sentence did not have clear overlap with extracted evidence."
+
+        source["citationCheck"] = {
+            "cited": True,
+            "confidence": confidence,
+            "reason": reason,
+            "claims": claims[:3],
+            "matchedExcerpt": best_match["matchedExcerpt"],
+            "overlapTerms": best_match["overlapTerms"][:8],
+            "checkedClaim": best_claim
+        }
+
+    return verified_sources
 
 # Import for tool schema
 from pydantic import BaseModel, Field, field_validator
@@ -779,17 +983,14 @@ def google_search(queries: List[str]) -> str:
             })
 
         evidence_data = collect_source_evidence(sources_data, queries)
-        evidence_urls_by_index = {evidence["index"]: evidence["url"] for evidence in evidence_data}
-        for source in sources_data:
-            if source["index"] in evidence_urls_by_index:
-                source["url"] = evidence_urls_by_index[source["index"]]
+        sources_data = apply_evidence_to_sources(sources_data, evidence_data)
 
         if evidence_data:
             formatted += "\n\nEvidence Extracted from Source Pages (ordered by relevance):\n"
             for evidence in evidence_data:
                 formatted += f"\n[{evidence['index']}] {evidence['title']}\n"
-                for excerpt_index, excerpt in enumerate(evidence["excerpts"], 1):
-                    formatted += f"    Evidence {excerpt_index}: {excerpt}\n"
+                for excerpt_index, excerpt in enumerate(evidence["evidence"], 1):
+                    formatted += f"    Evidence {excerpt_index}: {excerpt['text']}\n"
                 formatted += f"    URL: {evidence['url']}\n"
         else:
             formatted += "\n\nEvidence Extracted from Source Pages:\n"
@@ -1556,7 +1757,7 @@ FORBIDDEN: Do not say "According to search results" or similar phrases. Just sta
         logger.info(f"📝 [STREAM SUMMARIZE] Complete, {len(full_content)} chars")
 
         # Send sources
-        yield ("sources", sources_data)
+        yield ("sources", verify_source_citations(full_content, sources_data))
 
         # Send completion
         yield ("done", full_content)
